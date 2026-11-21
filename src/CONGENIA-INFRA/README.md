@@ -1,0 +1,358 @@
+# CONGENIA-INFRA
+
+Infraestructura como código oficial de CONGENIA. El estado está partido en dos
+stacks con ciclos de vida distintos:
+
+- `envs/shared`: persistente. Registro de imágenes (ECR), identidad de GitHub
+  Actions y zona DNS. Cuesta menos de USD 1/mes y sobrevive a los apagados.
+- `envs/aws`: la infraestructura oficial, identificada como `prod`. Concentra
+  todo el gasto y se destruye en cada pausa larga.
+
+Las imágenes ya no se construyen a mano: cada repositorio de servicio publica
+la suya en ECR por GitHub Actions al mergear. El despliegue se inicia desde
+**Actions -> deploy-production -> Run workflow**, con servicio y tag. Usa OIDC
+y `GITHUB_TOKEN`, sin PAT ni PR de actualización de imágenes.
+
+## Arquitectura
+
+| Capacidad | Implementación |
+|---|---|
+| Red | VPC, subredes edge/app/data en 2 AZ, SG y NACL |
+| Entrada | ALB con HTTPS y certificado ACM, DNS en Route 53 |
+| Cómputo | ECS Fargate, cinco servicios |
+| Datos | RDS PostgreSQL 16, Single-AZ y cifrada |
+| Sesiones | ElastiCache Redis 7 |
+| Documentos | S3 privado, cifrado y versionado |
+| Identidad | Keycloak en ECS |
+| Mensajería | RabbitMQ en ECS |
+| Registro | ECR con tags inmutables (`envs/shared`) |
+| Entrega | GitHub Actions por OIDC, sin llaves de AWS |
+
+Los módulos compartidos viven en `modules/`; el cableado, en `envs/`.
+
+## Requisitos
+
+- Terraform `>= 1.10`
+- AWS CLI v2 y credenciales del proyecto
+- `jq`, `curl`, Bash y GNU Make
+- Docker con `buildx` solo si se va a publicar una imagen a mano; el pipeline
+  no lo necesita
+
+El backend AWS usa el bucket versionado `congenia-tfstate`, con cifrado y lock
+nativo de S3. El estado contiene secretos generados y su acceso debe limitarse
+al equipo de infraestructura.
+
+## Comandos
+
+```bash
+make help
+make init ENV=aws|shared
+make plan ENV=aws|shared
+make create ENV=aws|shared
+make up-aws
+make smoke
+make smoke-integration
+make open
+make close
+make destroy
+make verify-teardown
+make nuke
+make cost-status
+```
+
+`ENV` vale `aws` por defecto.
+
+- `create` crea o reconcilia infraestructura; en AWS deja las tareas apagadas.
+- `up-aws` es el ciclo completo `create → migrate → open → smoke`.
+- `open` escala las tareas oficiales a las cantidades declaradas.
+- `close` lleva las tareas a cero sin borrar datos ni la red.
+- `destroy` elimina el entorno de aplicación; AWS exige confirmación explícita.
+  Conserva `envs/shared`, así que volver no exige republicar imágenes ni
+  re-delegar DNS.
+- `nuke` destruye además `envs/shared`. Es un cierre de proyecto, no una
+  operación de rutina.
+- `verify-teardown` le pregunta a AWS qué recursos del proyecto siguen vivos,
+  en lugar de confiar en que Terraform terminó en verde.
+- Opciones Terraform adicionales se pasan con `TF_VARS`, por ejemplo
+  `TF_VARS='-var=enable_flow_logs=true'`.
+
+## Despliegue oficial en AWS
+
+El diseño de lo que corre —red, capas de aislamiento, entrega de imágenes y
+persistencia— está en **[docs/ARQUITECTURA.md](docs/ARQUITECTURA.md)**.
+
+El ciclo de vida completo está en **[docs/DEPLOY.md](docs/DEPLOY.md)**, en tres partes:
+
+| Parte | Qué cubre | Con qué frecuencia |
+|---|---|---|
+| 1 | Preparar la cuenta: estado remoto, `envs/shared`, delegación de DNS, configuración de GitHub | Una vez por cuenta |
+| 2 | Desplegar, configurar Keycloak, probar, publicar una versión nueva | Cada despliegue |
+| 3 | Apagar: dormir servicios, destruir el entorno, nuke total | Cada pausa |
+
+Si `make plan ENV=aws` falla diciendo que no encuentra un repositorio ECR, la
+cuenta no pasó por la parte 1.
+
+Lo que sigue en este README es el resumen; el detalle está en ese documento.
+
+### 1. Comprobar plan y créditos
+
+```bash
+make cost-status
+aws sts get-caller-identity
+make plan ENV=aws
+```
+
+Revisar cuenta, región, nombres, reemplazos y costo antes del apply.
+
+### 2. Crear la base con servicios apagados
+
+```bash
+make create ENV=aws
+```
+
+`enable_services=false` es el default. Se crean la plataforma y sus
+dependencias, pero no se ejecutan imágenes pendientes o incompletas.
+
+### 3. Publicar imágenes inmutables
+
+Cada publicador ejecuta sus verificaciones y deja la imagen en ECR. Para una
+actualización de producción, abrir **Actions -> deploy-production -> Run
+workflow**, seleccionar `master` y `service`. Marcar `latest` para buscar la
+ultima imagen versionada publicada en ECR, sin conocer el tag. Para varios,
+elegir `service=selected` y `components=frontend,pdf-worker` (o `all` para los
+cinco componentes, sin migraciones). El resumen compara con ECS/scheduler y
+deja un JSON `resolved_tags`: usarlo con `latest` desmarcado para aplicar
+exactamente las versiones del preview. Un `tag` explicito sigue disponible
+para un servicio individual y para rollback. Para API con SQL nuevo,
+indicar también `migrate_tag`; se ejecuta antes de actualizar el servicio.
+La busqueda automatica no elige migraciones ni detecta cambios SQL necesarios.
+`preview_only` permite revisar el plan sin desplegar. `service=manifest` aplica
+juntos los seis tags versionados (sin rellenar `tag`), y `runtime_config` incluye
+explicitamente los cambios de variables de ejecucion de esos servicios.
+
+El workflow espera estabilidad y salud, y registra `images.tfvars` directamente
+con el `GITHUB_TOKEN` del repositorio. No utiliza `INFRA_TOKEN` ni abre PRs. El
+rol OIDC de despliegue es distinto del publicador y está limitado a las releases.
+Los detalles y pasos de migración están en [DEPLOY.md](docs/DEPLOY.md#28-publicar-y-desplegar-una-version-nueva).
+
+ECR es inmutable: la opcion `latest` resuelve un tag versionado derivado del
+commit; no utiliza un alias mutable llamado `latest`. Para
+publicar sin pasar por GitHub —una cuenta nueva, una depuración— siguen
+existiendo `./scripts/release-plan.sh` en el orquestador y
+`make migrate-image ENV=aws`, que calculan exactamente los mismos tags.
+
+El arranque en frío de una cuenta, incluida la configuración de GitHub, está
+en [docs/DEPLOY.md](docs/DEPLOY.md), parte 1.
+
+### 4. Cargar el esquema inicial
+
+```bash
+make migrate ENV=aws
+```
+
+La tarea aplica los SQL incluidos en la imagen de migración y registra cada
+archivo en `schema_migrations`. En una base existente omite los archivos ya
+aplicados y ejecuta los incrementales pendientes. Antes de actualizar una base
+con datos, tomar un snapshot y comprobar las precondiciones de las migraciones;
+`10_ficha_provisional.sql` rechaza historias con más de una ficha vigente por
+tenant. No usar `MIGRATE_FORCE` para actualizar producción.
+
+La API, PDF worker y CIE-10 usan `congenia_app` con un secreto independiente
+`congenia/prod/postgres-app`; la tarea de migración configura su login mediante
+`APP_DB_PASSWORD`. El usuario administrador se reserva para migraciones y
+Keycloak.
+
+### 5. TLS y DNS
+
+Con el dominio delegado a Route 53 (paso único, documentado en
+[docs/DEPLOY.md](docs/DEPLOY.md) parte 1), Terraform crea el registro de validación de ACM
+y el ALIAS al ALB, y espera el `ISSUED` dentro del mismo apply. No hay paso
+manual.
+
+Para un dominio cuyo DNS viva fuera de la cuenta, `-var=manage_dns=false`
+devuelve el proceso anterior de dos aplicaciones con `validate_certificate`;
+está descrito en `envs/aws/certificate.tf`.
+
+### 6. Abrir y validar
+
+```bash
+make open ENV=aws
+make smoke ENV=aws
+
+# Solo es necesario al actualizar un realm que ya existia: el import de
+# arranque de Keycloak no sobrescribe realms persistidos. El script restaura
+# profile/email/roles desde el realm master, agrega tenants al token, asigna
+# roles clinicos/dashboard y verifica el resultado.
+# La API de administracion no se publica en el ALB: abrir antes el tunel
+# privado en otra terminal (make db-access-up && make db-access-keycloak).
+export KEYCLOAK_BASE_URL="http://localhost:18080"
+export KEYCLOAK_PUBLIC_URL="$(terraform -chdir=envs/aws output -raw public_url)"
+export KEYCLOAK_ADMIN_PASSWORD="$(aws secretsmanager get-secret-value \
+  --secret-id "$(terraform -chdir=envs/aws output -raw keycloak_admin_secret_arn)" \
+  --query SecretString --output text)"
+export KEYCLOAK_MEDICO_PASSWORD="$(aws secretsmanager get-secret-value \
+  --secret-id "$(terraform -chdir=envs/aws output -raw keycloak_medico_initial_secret_arn)" \
+  --query SecretString --output text)"
+export KEYCLOAK_PROVISIONER_SECRET="$(aws secretsmanager get-secret-value \
+  --secret-id "$(terraform -chdir=envs/aws output -raw keycloak_provisioner_secret_arn)" \
+  --query SecretString --output text)"
+export KEYCLOAK_MEDICO_TENANTS="${KEYCLOAK_MEDICO_TENANTS:-23,254}"
+export KEYCLOAK_SUPERADMIN_USERNAME="${KEYCLOAK_SUPERADMIN_USERNAME:-admin-doctor}"
+export KEYCLOAK_SADC_TENANT="${KEYCLOAK_SADC_TENANT:-254}"
+./scripts/configure-keycloak-web.sh
+unset KEYCLOAK_ADMIN_PASSWORD KEYCLOAK_MEDICO_PASSWORD KEYCLOAK_MEDICO_TENANTS KEYCLOAK_SUPERADMIN_USERNAME KEYCLOAK_SADC_TENANT
+
+export SADC_CLIENT_SECRET="$(aws secretsmanager get-secret-value \
+  --secret-id "$(terraform -chdir=envs/aws output -raw sadc_client_secret_arn)" \
+  --query SecretString --output text)"
+make smoke-integration ENV=aws
+unset SADC_CLIENT_SECRET
+
+# Reporteria/agente: cargar secretos del PostgreSQL externo y del modelo.
+# El dataset se prepara con CONGENIA-REPORTING-PIPELINE; no hay task ECS.
+aws secretsmanager put-secret-value \
+  --secret-id "$(terraform -chdir=envs/aws output -raw reporting_database_app_url_secret_arn)" \
+  --secret-string "$REPORTING_DATABASE_APP_URL"
+aws secretsmanager put-secret-value \
+  --secret-id "$(terraform -chdir=envs/aws output -raw reporting_database_agent_readonly_url_secret_arn)" \
+  --secret-string "$REPORTING_DATABASE_AGENT_READONLY_URL"
+aws secretsmanager put-secret-value \
+  --secret-id "$(terraform -chdir=envs/aws output -raw reporting_llm_api_key_secret_arn)" \
+  --secret-string "$LLM_API_KEY"
+aws secretsmanager put-secret-value \
+  --secret-id "$(terraform -chdir=envs/aws output -raw reporting_mcp_token_secret_arn)" \
+  --secret-string "$REPORTING_MCP_TOKEN"
+
+# Batch CIE-10 a demanda: prueba el mismo job que correra al final de mes.
+# Antes de ejecutarlo hay que subir CIE10.csv y CIE10_Traductor.csv a
+# s3://$(terraform -chdir=envs/aws output -raw docs_bucket)/cie10/input/
+# y cargar OPENAI_API_KEY en el secreto cie10_openai_secret_arn.
+make cie10-batch ENV=aws
+```
+
+`envs/aws/features.tfvars` mantiene reportería y Scheduler deshabilitados hasta
+que sus dependencias estén listas. Terraform crea los secretos vacíos, y la API
+puede arrancar sin inyectar los de reportería. Después de cargar sus cuatro
+valores, ejecutar `make reporting-ready`, validar conectividad y dataset, y
+versionar `enable_reporting = true` en ese archivo. Aplicar con `make plan` y
+`make open`. Para CIE-10: cargar clave y CSV, ejecutar `make cie10-ready` y una
+prueba manual; después versionar `enable_cie10_schedule = true`. El calendario
+corre a las 06:00 del último día de cada mes, hora de Guatemala.
+
+El acceso web inicial usa medico.inicial y la clave temporal del secreto keycloak_medico_initial_secret_arn. Los usuarios posteriores reciben acceso mediante grupos, por ejemplo /instituciones/254/medicos o /instituciones/254/revisores; no se asignan roles ni tenants directamente al usuario. /superadministradores concede visibilidad global y administracion de catalogos.
+
+Con el perfil menor a 1 TPS se espera `1/1` para frontend, API, Keycloak,
+RabbitMQ y PDF worker.
+
+Antes de tráfico real, completar un recorrido sin datos personales: cargar
+PNG/JPEG y PDF válidos, rechazar MIME/tamaños inválidos, enviar dos veces la
+misma ficha, confirmar un solo `ficha_id`, verificar el PDF generado y revisar
+que logs y nombres de objeto no contengan PHI ni capabilities.
+
+Para CIE-10, la ejecucion manual del batch solo prepara la cola: la revision,
+aceptacion, rechazo y correccion se hace despues en `/dashboard/cie10`.
+
+Para reportería/agente, `CONGENIA-REPORTING-PIPELINE` no es un servicio de ECS.
+Es una herramienta operativa para desidentificar el snapshot SIGSA, validar que
+no queden identificadores directos e importar el CSV resultante a un PostgreSQL
+externo. La API solo consume las URLs de esa base y la `LLM_API_KEY` por Secrets
+Manager.
+
+## AWS Free Plan y control de consumo
+
+El plan gratuito actual funciona con créditos. NAT Gateway, ALB, Fargate,
+ElastiCache, WAF, endpoints privados, Secrets Manager y CloudWatch son
+servicios medidos: que la cuenta sea `FREE` no los vuelve costo cero.
+
+Los defaults oficiales minimizan consumo sin cambiar la identidad productiva:
+
+- nombres `congenia-prod-*` y `APP_ENV=prod`;
+- RDS `db.t4g.micro`, Single-AZ, 20 GiB y un día de backup;
+- Redis `cache.t4g.micro`, un nodo y sin snapshots de sesiones temporales;
+- una tarea por servicio y tamaños Fargate equivalentes al entorno local;
+- servicios apagados hasta ejecutar `make open`;
+- endpoint gateway S3, que no tiene cargo adicional;
+- NAT habilitado para la salida requerida por los servicios;
+- WAF encendido (correccion A2); endpoints privados, Flow Logs, VPN y
+  Multi-AZ desactivados por defecto.
+
+`free_plan_mode=true` impide durante `plan` usar Multi-AZ, tamaños mayores,
+más de un día de backup o más de una tarea por servicio. Para cambiar esas
+decisiones se debe desactivar explícitamente el perfil y revisar presupuesto.
+
+NAT, ALB, RDS y Redis siguen consumiendo créditos aunque las tareas estén en
+cero. `make close` reduce Fargate y detiene la EC2 de acceso; para detener todo consumo hay que destruir
+la infraestructura.
+
+## Acceso desde DBeaver
+
+`db-access` es un stack independiente: una EC2 privada con SSM y un túnel a
+RDS. Usa la red existente y se identifica por `Component=db-access` y el
+nombre `congenia-prod-db-access`. No se crea con `make up-aws`.
+
+```bash
+make db-access-plan
+make db-access-up
+make db-access-status
+make db-access-tunnel       # DBeaver: 127.0.0.1:15432, base congenia, SSL
+make db-access-stop         # detiene EC2; conserva el disco EBS
+make db-access-destroy CONFIRM_DESTROY=destroy-congenia-db-access
+make db-access-verify       # consulta AWS; errores no equivalen a ausencia
+```
+
+Antes del primer uso sobre infraestructura existente, seguir la preparación
+única y la configuración SSL en [DEPLOY.md, sección 2.8](docs/DEPLOY.md#28-acceso-a-rds-desde-dbeaver).
+`close` / `stop` también detienen este acceso; `destroy` y `nuke` lo eliminan
+primero. El cierre del túnel con Ctrl-C **no apaga la EC2**. La eliminación
+incluye volumen, reglas, IAM y documento SSM; conserva el estado remoto.
+
+## Destrucción automatizada
+
+Los stacks principales se conservan; `envs/db-access` tiene estado propio y
+se destruye antes de `envs/aws`:
+
+| | `envs/shared` | `envs/aws` |
+|---|---|---|
+| Contiene | ECR, OIDC, rol de CI, zona Route 53 | VPC, NAT, ALB, RDS, Redis, ECS, secretos |
+| Cuesta | menos de USD 1/mes | prácticamente todo el gasto |
+| Lo destruye | `make nuke` | `make destroy ENV=aws` |
+
+Apagado de rutina:
+
+```bash
+make destroy ENV=aws CONFIRM_DESTROY=destroy-congenia-aws
+```
+
+El target lleva ECS a cero, activa temporalmente `allow_destroy=true` y elimina
+RDS sin snapshot final, todas las versiones del bucket, los secretos y el resto
+del stack de aplicación. Es irreversible en cuanto a datos, pero **conserva las
+imágenes y el DNS**: volver a levantar es `make up-aws`.
+
+AWS, cierre de proyecto:
+
+```bash
+make nuke CONFIRM_DESTROY=destroy-congenia-todo
+```
+
+Destruye `envs/aws` y después `envs/shared` —el orden es obligatorio—, y
+termina comprobando contra AWS que no quedó nada, más el checklist de lo que
+vive fuera de Terraform (bucket del estado, delegación en name.com, token de
+GitHub). Ejecutado sin la confirmación, solo imprime qué haría.
+
+Si el estado AWS está vacío, el target termina sin crear nada. Un recurso que
+exista fuera del estado nunca debe eliminarse a ciegas: primero se recupera una
+versión válida del backend o se importa, se revisa el plan y recién entonces se
+autoriza su destrucción.
+
+## Riesgos conocidos
+
+- RabbitMQ corre en Fargate sin almacenamiento persistente; un reinicio puede
+  perder trabajos. Antes de mayor carga debe migrarse a SQS/Amazon MQ o a un
+  patrón outbox.
+- Las migraciones incrementales se registran por nombre de archivo: no editar
+  un SQL ya aplicado; agregar uno nuevo para cualquier cambio posterior.
+- Los smoke tests comprueban contenido y no solo códigos HTTP: con las reglas
+  de path mal aplicadas el ALB devuelve 200 sirviendo el SPA en todas las
+  rutas, y un smoke que mirara el código daría un falso verde.
+- La cuenta Free Plan tiene vigencia y créditos finitos. Consultarlos antes y
+  después de cada ventana de prueba con `make cost-status`.

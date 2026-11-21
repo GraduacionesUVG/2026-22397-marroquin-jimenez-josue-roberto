@@ -1,0 +1,223 @@
+output "alb_dns_name" {
+  value = module.edge.alb_dns_name
+}
+
+output "vpc_id" {
+  value = module.network.vpc_id
+}
+
+output "db_access_context" {
+  description = "Contrato sin secretos para el stack independiente db-access. Publicar tras importar las reglas data."
+  value = {
+    version     = 1
+    account_id  = data.aws_caller_identity.current.account_id
+    region      = var.region
+    name_prefix = var.name_prefix
+    environment = var.environment
+    vpc_id      = module.network.vpc_id
+    subnet_id   = module.network.app_subnet_ids[0]
+    data_sg_id  = module.network.data_sg_id
+    db_host     = module.data.db_address
+    db_port     = module.data.db_port
+    db_name     = module.data.db_name
+
+    # Consola de Keycloak por el mismo relay (A1): nombre de Cloud Map, puerto
+    # del contenedor, grupo de operador y puerto local fijo del tunel.
+    operator_sg_id       = module.network.operator_sg_id
+    keycloak_host        = "keycloak.${aws_service_discovery_private_dns_namespace.this.name}"
+    keycloak_port        = local.ports.keycloak
+    keycloak_tunnel_port = var.keycloak_admin_tunnel_port
+  }
+}
+
+output "db_endpoint" {
+  value     = module.data.db_endpoint
+  sensitive = true
+}
+
+output "docs_bucket" {
+  value = module.data.docs_bucket
+}
+
+output "ecr_repositories" {
+  value = { for k, v in data.aws_ecr_repository.this : k => v.repository_url }
+}
+
+output "private_namespace" {
+  value = aws_service_discovery_private_dns_namespace.this.name
+}
+
+output "waf_web_acl_arn" {
+  value = module.security.web_acl_arn
+}
+
+output "flow_log_group" {
+  value = module.security.flow_log_group
+}
+
+output "client_vpn_dns" {
+  value = module.vpn.client_vpn_dns
+}
+
+output "region" {
+  value = var.region
+}
+
+output "release_task_definitions" {
+  description = "Revisiones exactas que verifica el workflow de despliegue manual."
+  value = {
+    api        = module.api.task_definition_arn
+    frontend   = module.frontend.task_definition_arn
+    pdf-worker = module.pdf_worker.task_definition_arn
+    keycloak   = module.keycloak.task_definition_arn
+  }
+}
+
+output "public_url" {
+  description = "Punto de entrada publico. Cambia a https cuando el certificado queda emitido."
+  value       = local.public_url
+}
+
+output "sadc_client_secret_arn" {
+  description = "ARN para recuperar el client secret usado por el smoke OAuth, sin exponer su valor."
+  value       = aws_secretsmanager_secret.keycloak_sadc.arn
+}
+
+output "keycloak_provisioner_secret_arn" {
+  description = "Secreto del cliente congenia-provisioner (cuenta de servicio de aprovisionamiento)."
+  value       = aws_secretsmanager_secret.keycloak_provisioner.arn
+}
+
+output "keycloak_admin_secret_arn" {
+  description = "ARN del password del administrador bootstrap de Keycloak."
+  value       = aws_secretsmanager_secret.keycloak_admin.arn
+}
+
+output "keycloak_medico_initial_secret_arn" {
+  description = "ARN del password temporal del usuario medico.inicial; Keycloak obliga a cambiarlo al primer acceso."
+  value       = aws_secretsmanager_secret.keycloak_medico_initial.arn
+}
+
+output "db_secret_arn" {
+  description = "ARN del password de PostgreSQL para recuperacion operativa controlada."
+  value       = aws_secretsmanager_secret.db.arn
+}
+
+output "db_app_secret_arn" {
+  description = "ARN de la credencial del rol congenia_app."
+  value       = aws_secretsmanager_secret.db_app.arn
+}
+
+# ── Carga del esquema ───────────────────────────────────────────────────────
+# Los consume scripts/migrate.sh (`make migrate`).
+
+output "ecs_cluster" {
+  value = module.platform.cluster_name
+}
+
+output "migrate_task_definition" {
+  description = "ARN con revision: se ejecuta exactamente lo que declara el estado."
+  value       = module.migrate.task_definition_arn
+}
+
+output "migrate_network_config" {
+  description = "Listo para `aws ecs run-task --network-configuration`."
+  value = jsonencode({
+    awsvpcConfiguration = {
+      subnets        = module.network.app_subnet_ids
+      securityGroups = [module.network.app_sg_id]
+      assignPublicIp = "DISABLED"
+    }
+  })
+}
+
+output "migrate_log_group" {
+  value = module.platform.log_group_names["migrate"]
+}
+
+output "migrate_image_repository" {
+  value = data.aws_ecr_repository.this["congenia/migrate"].repository_url
+}
+
+output "cie10_task_definition" {
+  description = "Task definition del batch mensual CIE-10."
+  value       = aws_ecs_task_definition.cie10.arn
+}
+
+output "cie10_indexer_task_definition" {
+  description = "Task definition one-shot para reconstruir el indice RAG CIE-10."
+  value       = aws_ecs_task_definition.cie10_indexer.arn
+}
+
+output "cie10_vector_index" {
+  description = "Bucket e indice de Amazon S3 Vectors usados por CIE-10."
+  value = {
+    bucket = aws_s3vectors_vector_bucket.cie10.vector_bucket_name
+    index  = aws_s3vectors_index.cie10.index_name
+    arn    = aws_s3vectors_index.cie10.index_arn
+  }
+}
+
+output "cie10_log_group" {
+  description = "Log group de CloudWatch para ejecuciones del batch CIE-10."
+  value       = module.platform.log_group_names["cie10"]
+}
+
+output "cie10_openai_secret_arn" {
+  description = "ARN del secreto OPENAI_API_KEY usado por el batch CIE-10."
+  value       = aws_secretsmanager_secret.cie10_openai.arn
+}
+
+output "cie10_input_uris" {
+  description = "Snapshots S3 requeridos antes de ejecutar el batch."
+  value       = [local.cie10_catalog_s3_uri, local.cie10_translator_s3_uri, local.cie10_reference_s3_uri]
+}
+
+# ── TLS ─────────────────────────────────────────────────────────────────────
+
+output "acm_validation_records" {
+  description = <<-DESC
+    Registros de validacion del certificado. Con `manage_dns = true` los crea
+    Terraform y este output queda solo como diagnostico; con `manage_dns =
+    false` son los CNAME que hay que pegar a mano en el proveedor DNS.
+  DESC
+  value = flatten([
+    for cert in aws_acm_certificate.this : [
+      for opcion in cert.domain_validation_options : {
+        nombre = opcion.resource_record_name
+        tipo   = opcion.resource_record_type
+        valor  = opcion.resource_record_value
+      }
+    ]
+  ])
+}
+
+output "acm_certificate_status" {
+  description = "PENDING_VALIDATION hasta que el CNAME exista; luego ISSUED."
+  value       = one(aws_acm_certificate.this[*].status)
+}
+
+output "dns_managed" {
+  description = "true cuando Terraform administra validacion y ALIAS en Route 53."
+  value       = local.gestiona_dns
+}
+
+output "reporting_database_app_url_secret_arn" {
+  description = "Secreto donde se carga la URL app de PostgreSQL externo para reportería."
+  value       = aws_secretsmanager_secret.reporting_database_app_url.arn
+}
+
+output "reporting_database_agent_readonly_url_secret_arn" {
+  description = "Secreto donde se carga la URL readonly del agente de reportería."
+  value       = aws_secretsmanager_secret.reporting_database_agent_readonly_url.arn
+}
+
+output "reporting_llm_api_key_secret_arn" {
+  description = "Secreto donde se carga la API key del modelo para el agente de reportería."
+  value       = aws_secretsmanager_secret.reporting_llm_api_key.arn
+}
+
+output "reporting_mcp_token_secret_arn" {
+  description = "Secreto donde se carga el bearer token interno del endpoint MCP de reportería."
+  value       = aws_secretsmanager_secret.reporting_mcp_token.arn
+}

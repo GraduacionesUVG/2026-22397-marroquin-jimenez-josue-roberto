@@ -1,0 +1,410 @@
+variable "region" {
+  type    = string
+  default = "us-east-1"
+}
+
+variable "name_prefix" {
+  type    = string
+  default = "congenia"
+}
+
+variable "environment" {
+  description = "Entorno oficial al que pertenecen los recursos."
+  type        = string
+  default     = "prod"
+}
+
+variable "free_plan_mode" {
+  description = <<-DESC
+    Impone limites preventivos compatibles con el perfil de bajo consumo de
+    la cuenta AWS Free Plan. No convierte servicios medidos en gratuitos: su
+    consumo se descuenta de los creditos disponibles.
+  DESC
+  type        = bool
+  default     = true
+}
+
+variable "multi_az" {
+  description = "Multi-AZ en RDS. false en la primera iteracion por costo."
+  type        = bool
+  default     = false
+}
+
+variable "db_instance_class" {
+  type    = string
+  default = "db.t4g.micro"
+}
+
+variable "db_backup_retention_days" {
+  description = <<-DESC
+    Dias de backups automaticos de RDS. El perfil AWS Free Plan usa 1, el valor
+    por defecto de la API/CLI y compatible con la restriccion de la cuenta.
+    Aumentar solo despues de cambiar el plan de la cuenta y revisar el costo de
+    almacenamiento de backups.
+  DESC
+  type        = number
+  default     = 1
+
+  validation {
+    condition = (
+      floor(var.db_backup_retention_days) == var.db_backup_retention_days &&
+      var.db_backup_retention_days >= 0 &&
+      var.db_backup_retention_days <= 35
+    )
+    error_message = "db_backup_retention_days debe ser un numero entero entre 0 y 35."
+  }
+}
+
+variable "redis_node_type" {
+  type    = string
+  default = "cache.t4g.micro"
+}
+
+variable "enable_private_endpoints" {
+  description = <<-DESC
+    Crea endpoints privados de ECR, Logs y Secrets Manager. Se mantienen
+    disponibles para endurecimiento futuro, pero el perfil Free Plan usa el
+    NAT ya requerido por la aplicacion para evitar ocho cargos hora-AZ
+    adicionales.
+  DESC
+  type        = bool
+  default     = false
+}
+
+variable "enable_waf" {
+  description = <<-EOT
+    WAF v2 delante del ALB: conjunto comun (OWASP), entradas maliciosas
+    conocidas, inyeccion SQL y limite por IP. Encendido desde la correccion A2,
+    posterior a la evaluacion. Costo estimado en us-east-1: USD 5/mes por el
+    web ACL + USD 1/mes por cada una de sus 4 reglas + USD 0.60 por millon de
+    peticiones (unos USD 9/mes a este volumen). Usa 1102 de las 1500 WCU
+    incluidas.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "enable_flow_logs" {
+  description = "Activa VPC Flow Logs hacia CloudWatch. Tiene costo por ingestion y almacenamiento."
+  type        = bool
+  default     = false
+}
+
+variable "image_tag" {
+  description = <<-DESC
+    Tag por defecto, para cuando `image_tags` no trae uno para ese servicio.
+    Debe ser reemplazado por el manifiesto images.tfvars antes de aplicar.
+  DESC
+  type        = string
+  default     = "pending-publication"
+}
+
+variable "image_tags" {
+  description = <<-DESC
+    Tag desplegado por servicio: { api = "1.0.0-9696cd8", frontend = ... }.
+
+    Existe porque los servicios viven en repositorios distintos y avanzan
+    a ritmos distintos: un solo tag compartido obliga a republicar todas las
+    imagenes para mover una. El valor lo genera `scripts/release-plan.sh` del
+    repo orquestador y se versiona en `envs/aws/images.tfvars`, de modo que el
+    control de versiones registra que imagen exacta corre cada servicio.
+  DESC
+  type        = map(string)
+  default     = {}
+}
+
+variable "cie10_catalog_s3_uri" {
+  description = "Snapshot del catalogo institucional CIE-10 que consume el batch mensual."
+  type        = string
+  default     = null
+}
+
+variable "cie10_translator_s3_uri" {
+  description = "Snapshot de diagnosticos del traductor que consume el batch mensual."
+  type        = string
+  default     = null
+}
+
+variable "cie10_reference_s3_uri" {
+  description = "Snapshot congelado de la referencia jerarquica verasativa/CIE-10."
+  type        = string
+  default     = null
+}
+
+variable "cie10_rag_version" {
+  description = "Identificador reproducible del corpus RAG; debe cambiar al reindexar catalogos o embeddings."
+  type        = string
+  default     = null
+  nullable    = true
+}
+
+variable "cie10_review_export_s3_prefix" {
+  description = "Prefijo de exportaciones CIE10 historicas que sirve la API."
+  type        = string
+  default     = null
+}
+
+variable "cie10_max_records" {
+  description = "Limite opcional de registros a procesar por corrida. null procesa todos los pendientes nuevos."
+  type        = number
+  default     = null
+}
+
+variable "cie10_openai_model" {
+  description = "Modelo usado por el batch CIE-10."
+  type        = string
+  default     = "gpt-6-luna"
+  validation {
+    condition     = var.cie10_openai_model == "gpt-6-luna"
+    error_message = "cie10_openai_model must remain gpt-6-luna."
+  }
+}
+
+variable "cie10_reasoning_effort" {
+  description = "Reasoning effort usado por el batch CIE-10."
+  type        = string
+  default     = "medium"
+  validation {
+    condition     = var.cie10_reasoning_effort == "medium"
+    error_message = "cie10_reasoning_effort must remain medium."
+  }
+}
+
+variable "cie10_repair_attempts" {
+  description = "Intentos para reparar una respuesta sin codigos CIE-10 con formato valido."
+  type        = number
+  default     = 2
+}
+
+variable "cie10_monthly_schedule" {
+  description = "Expresion schedule() o cron() de EventBridge Scheduler para ejecutar el batch."
+  type        = string
+  default     = "cron(0 6 L * ? *)"
+}
+
+variable "enable_cie10_schedule" {
+  description = "Habilitar solo tras cargar los CSV, el secreto OpenAI y validar una ejecucion manual."
+  type        = bool
+  default     = false
+}
+
+variable "enable_reporting" {
+  description = "Inyectar secretos de reporteria solo cuando sus cuatro valores esten cargados."
+  type        = bool
+  default     = false
+}
+
+variable "cie10_openai_api_key" {
+  description = "Opcional: valor inicial para el secreto OPENAI_API_KEY del batch. Si es null, se crea el secret y se carga manualmente."
+  type        = string
+  sensitive   = true
+  default     = null
+}
+
+variable "llm_model" {
+  description = "Modelo usado por el agente de reportería Text-to-SQL."
+  type        = string
+  default     = "gpt-6-luna"
+  validation {
+    condition     = var.llm_model == "gpt-6-luna"
+    error_message = "llm_model must remain gpt-6-luna."
+  }
+}
+
+variable "llm_reasoning_effort" {
+  description = "Reasoning effort usado por el agente de reportería."
+  type        = string
+  default     = "low"
+  validation {
+    condition     = var.llm_reasoning_effort == "low"
+    error_message = "llm_reasoning_effort must remain low."
+  }
+}
+
+variable "reporting_conversation_ttl_seconds" {
+  description = "TTL deslizante de las conversaciones efimeras del agente."
+  type        = number
+  default     = 1800
+  validation {
+    condition     = var.reporting_conversation_ttl_seconds >= 60 && var.reporting_conversation_ttl_seconds <= 3600
+    error_message = "reporting_conversation_ttl_seconds must be between 60 and 3600."
+  }
+}
+
+variable "reporting_conversation_max_turns" {
+  description = "Cantidad maxima de turnos visibles conservados en Redis."
+  type        = number
+  default     = 8
+}
+
+variable "agent_prompt_version" {
+  description = "Version del prompt del agente de reportería."
+  type        = string
+  default     = "agent-reporting-v1"
+}
+
+variable "reporting_dataset_version" {
+  description = "Version del dataset desidentificado cargado en la base externa de reportería."
+  type        = string
+  default     = "unset"
+}
+
+variable "reporting_schema_version" {
+  description = "Version del schema autorizado de reportería/agente."
+  type        = string
+  default     = "reporting-v1"
+}
+
+variable "reporting_statement_timeout_ms" {
+  description = "Timeout de cada consulta readonly del agente de reportería."
+  type        = number
+  default     = 5000
+}
+
+variable "allow_destroy" {
+  description = <<-DESC
+    Desactiva temporalmente las protecciones que impiden destruir RDS, el
+    bucket versionado y los repos ECR con contenido. Debe permanecer false en
+    operacion normal; `make destroy ENV=aws` lo activa con confirmacion
+    explicita antes de ejecutar el destroy.
+  DESC
+  type        = bool
+  default     = false
+}
+
+variable "enable_services" {
+  description = <<-DESC
+    Arranca las tareas ECS permanentes. Debe quedar false durante bootstrap,
+    publicacion de imagenes, migracion y configuracion TLS; se habilita solo
+    cuando el sistema oficial esta listo para recibir trafico.
+  DESC
+  type        = bool
+  default     = false
+}
+
+variable "service_desired_counts" {
+  description = "Cantidad de tareas por servicio cuando enable_services=true."
+  type        = map(number)
+  default = {
+    keycloak   = 1
+    rabbitmq   = 1
+    api        = 1
+    pdf-worker = 1
+    frontend   = 1
+  }
+
+  validation {
+    condition = alltrue([
+      for count in values(var.service_desired_counts) :
+      floor(count) == count && count >= 0
+    ])
+    error_message = "Todos los service_desired_counts deben ser enteros no negativos."
+  }
+}
+
+# ── TLS ─────────────────────────────────────────────────────────────────────
+
+variable "domain_name" {
+  description = <<-DESC
+    Dominio del punto de entrada publico. Registrado en name.com, con los
+    nameservers delegados a la zona de Route 53 que crea envs/shared: los
+    registros de validacion y el ALIAS al ALB los escribe Terraform.
+    null = sin certificado, el ALB se queda con el listener 80.
+  DESC
+  type        = string
+  default     = "cogenia.app"
+}
+
+variable "subject_alternative_names" {
+  description = <<-DESC
+    Nombres adicionales del certificado. Agregar "*.cogenia.app" no cuesta un
+    registro de validacion extra: ACM reutiliza el mismo CNAME del apex.
+  DESC
+  type        = list(string)
+  default     = []
+}
+
+variable "manage_dns" {
+  description = <<-DESC
+    Administra los registros DNS en la zona de Route 53 creada por envs/shared:
+    la validacion del certificado y el ALIAS del dominio hacia el ALB.
+
+    Con esto en true el certificado se emite dentro del mismo `apply` y no hay
+    ningun paso manual, ni siquiera al recrear la infraestructura desde cero.
+    Requiere haber delegado los nameservers en name.com una sola vez; el
+    procedimiento esta en docs/DEPLOY.md, parte 1.
+
+    Ponerlo en false devuelve el proceso manual de dos aplicaciones descrito en
+    certificate.tf, para un dominio cuyo DNS viva fuera de la cuenta.
+  DESC
+  type        = bool
+  default     = true
+}
+
+variable "validate_certificate" {
+  description = <<-DESC
+    OBSOLETA cuando `manage_dns = true`, que es el default: con la zona en
+    Route 53 la validacion ya no depende de un paso humano y este interruptor
+    no hace falta.
+
+    Solo tiene efecto con `manage_dns = false`, donde sigue siendo el segundo
+    paso del proceso: espera a que ACM emita el certificado y entonces crea el
+    listener 443. Encenderlo ANTES de crear el CNAME a mano deja el apply
+    esperando hasta 60 minutos.
+  DESC
+  type        = bool
+  default     = false
+}
+
+# ── Endurecimiento ──────────────────────────────────────────────────────────
+
+variable "enable_site_to_site_vpn" {
+  description = <<-DESC
+    Tunel IPsec hacia el dominio externo (DB de Nursera). Requiere que el otro
+    extremo provea IP publica del gateway, ASN y rangos alcanzables.
+  DESC
+  type        = bool
+  default     = false
+}
+
+variable "remote_gateway_ip" {
+  type    = string
+  default = null
+}
+
+variable "remote_cidrs" {
+  type    = list(string)
+  default = []
+}
+
+variable "enable_client_vpn" {
+  description = "Acceso del equipo a la red privada. Requiere certificados en ACM."
+  type        = bool
+  default     = false
+}
+
+variable "keycloak_admin_tunnel_port" {
+  description = <<-EOT
+    Puerto local con el que los operadores abren la consola de Keycloak por el
+    tunel de Session Manager (stack db-access). Keycloak publica su consola en
+    http://localhost:<puerto>, que solo existe en la maquina del operador: el
+    ALB no enruta /admin/*.
+  EOT
+  type        = number
+  default     = 18080
+
+  validation {
+    condition     = var.keycloak_admin_tunnel_port >= 1024 && var.keycloak_admin_tunnel_port <= 65535
+    error_message = "keycloak_admin_tunnel_port debe ser un puerto no privilegiado."
+  }
+}
+
+variable "client_vpn_server_certificate_arn" {
+  type    = string
+  default = null
+}
+
+variable "client_vpn_root_certificate_arn" {
+  type    = string
+  default = null
+}
