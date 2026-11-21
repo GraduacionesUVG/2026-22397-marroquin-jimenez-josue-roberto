@@ -1,0 +1,145 @@
+{
+  "ficha_clinica": {
+    "_tabla": "Version de una ficha clinica. La ficha inicial y cada adenda son filas distintas que comparten ficha_raiz_id; solo una por raiz es vigente.",
+    "paciente_id": "Paciente de la ficha",
+    "estado_ficha": "BORRADOR | PENDIENTE | COMPLETA | VALIDADA | ARCHIVADA. PENDIENTE = adenda esperando revision; ARCHIVADA = version reemplazada o rechazada",
+    "historia_clinica": "Numero de historia clinica del paciente en la institucion. Se busca junto con id_tenant",
+    "id_tenant": "Institucion duena de la ficha. El acceso a cada tenant lo otorga Keycloak",
+    "ficha_raiz_id": "Primera version de la ficha. Todas las adendas apuntan a ella (en la original es su propio ficha_id)",
+    "es_vigente": "TRUE en la version que se muestra. Indice unico parcial: una vigente por ficha_raiz_id",
+    "motivo_solicitud": "Motivo con el que el medico solicito la adenda",
+    "motivo_rechazo": "Motivo del revisor al rechazar la adenda",
+    "estado_revision": "NULL en la version original. PENDIENTE | APROBADA | RECHAZADA en las adendas",
+    "fecha_resolucion": "Cuando el revisor aprobo o rechazo la adenda",
+    "resuelta_por": "Revisor que resolvio la adenda"
+  },
+  "datos_adicionales_ficha": {
+    "sexo_id": "Sexo del paciente"
+  },
+  "signo_alerta_ficha": {
+    "added_in_revision": "TRUE si el signo se agrego en una adenda",
+    "replaces_signo_id": "Signo de la version anterior que este reemplaza. NULL si es nuevo"
+  },
+  "examen_ficha": {
+    "added_in_revision": "TRUE si el examen se agrego en una adenda",
+    "replaces_examen_id": "Examen de la version anterior que este reemplaza. NULL si es nuevo"
+  },
+  "consentimiento": {
+    "aceptacion_contacto": "Acepta ser contactado para seguimiento. Opcional"
+  },
+  "observacion_ficha": {
+    "_tabla": "Observaciones en texto libre de una ficha, cifradas en reposo con cifrado de sobre (DEK por registro).",
+    "observacion_id": "ID de la observacion",
+    "ficha_id": "Version de la ficha en la que se registro",
+    "texto_enc": "Texto cifrado con la DEK",
+    "texto_dek_enc": "DEK cifrada con la clave maestra",
+    "agregada_en_revision": "TRUE si la observacion vino en una adenda",
+    "fecha_creacion": "Timestamp de creacion",
+    "usuario_id": "Autor de la observacion"
+  },
+  "paciente_nombre_token": {
+    "_tabla": "Indice ciego para buscar pacientes por nombre sin descifrarlo: un HMAC por cada token normalizado del nombre.",
+    "paciente_id": "Paciente al que pertenece el token",
+    "token_hmac": "HMAC-SHA256 de un token del nombre. La llave vive fuera de la base"
+  },
+  "institucion_tenant": {
+    "_tabla": "Instituciones (tenants). Keycloak decide a que tenants accede cada usuario; esta tabla guarda el nombre visible y da integridad referencial.",
+    "id_tenant": "ID de la institucion. Igual al atributo tenants del grupo en Keycloak",
+    "nombre": "Nombre visible de la institucion",
+    "activo": "FALSE oculta la institucion en tenantOptions",
+    "fecha_creacion": "Timestamp de alta",
+    "fecha_modificacion": "Timestamp de la ultima modificacion"
+  },
+  "sexo_catalogo": {
+    "_tabla": "Catalogo de sexo del paciente.",
+    "sexo_id": "ID del catalogo",
+    "codigo": "M | F | I",
+    "nombre": "Masculino | Femenino | Indeterminado",
+    "activo": "FALSE lo oculta en el formulario",
+    "orden": "Orden de despliegue"
+  },
+  "auditoria_evento": {
+    "_tabla": "Bitacora de auditoria append-only con cadena de hashes. Un trigger asigna secuencia y hashes; otros bloquean UPDATE, DELETE y TRUNCATE. Verificacion: SELECT * FROM verificar_cadena_auditoria().",
+    "usuario_id": "Usuario interno (usuario.usuario_id) cuando aplica. El actor real esta en actor_sub/actor_username",
+    "entidad_tipo": "Ficha | Paciente | Consentimiento | Sesion | Archivo | Catalogo | Cie10",
+    "entidad_id": "ID del objeto afectado. Los IDs que no son UUID van en detalle_json.entidadRef",
+    "detalle_json": "Contexto estructurado por tipo de evento. Sin nombres ni texto libre del paciente (los terminos de busqueda van hasheados)",
+    "actor_username": "Username de Keycloak, o ID del medico externo en sesiones de integracion",
+    "actor_roles": "Roles del token al momento del evento",
+    "id_tenant": "Institucion afectada cuando el evento toca un paciente",
+    "http_method": "Metodo HTTP de la peticion",
+    "status_code": "Codigo HTTP de la respuesta",
+    "request_id": "X-Request-Id para correlacionar con los logs de la aplicacion"
+  },
+  "tipo_evento_catalogo": {
+    "_tabla": "Catalogo cerrado de tipos de evento. auditoria_evento.tipo_evento tiene FK aqui: un tipo nuevo se registra en la misma migracion que lo introduce.",
+    "codigo": "Codigo del evento (ej: FICHA_LEIDA)",
+    "categoria": "ACCESO | CONSULTA | MODIFICACION | VALIDACION | INTEGRACION | ARCHIVO | CATALOGO",
+    "descripcion": "Que representa el evento"
+  },
+  "schema_migrations": {
+    "_tabla": "Migraciones aplicadas por el servicio migrate (local) o make migrate (AWS).",
+    "version": "Nombre del archivo NN_*.sql aplicado",
+    "applied_at": "Cuando se aplico"
+  },
+  "cie10_run": {
+    "_tabla": "Una ejecucion del batch mensual CIE-10 (CONGENIA-CIE10).",
+    "run_id": "ID de la corrida",
+    "estado": "RUNNING | COMPLETED | FAILED",
+    "source_catalog_uri": "Ruta local o s3:// del CSV del catalogo usado",
+    "source_translator_uri": "Ruta local o s3:// del CSV de diagnosticos (traductor) usado",
+    "model": "Modelo de OpenAI usado",
+    "prompt_version": "Version del prompt del sistema",
+    "max_records": "Limite de registros procesados. NULL = sin limite",
+    "processed_count": "Registros procesados",
+    "suggestion_count": "Registros con sugerencias validas",
+    "error_count": "Registros que fallaron",
+    "started_at": "Inicio de la corrida",
+    "finished_at": "Fin de la corrida",
+    "metadata_json": "Metadatos adicionales de la corrida"
+  },
+  "cie10_sugerencia": {
+    "_tabla": "Diagnostico pendiente de clasificar con las sugerencias de la IA. Una fila por registro del traductor; es la cola del dashboard.",
+    "codigo_traductor": "ID del registro en el CSV del traductor",
+    "run_id": "Corrida que genero la sugerencia",
+    "diagnostico": "Texto libre del diagnostico de emergencia. Puede contener datos clinicos sensibles y se envia a OpenAI",
+    "cie10_original": "Codigo interno asignado originalmente en el traductor",
+    "ai_status": "suggestions | insufficient_information | error",
+    "sugerencias": "Arreglo JSON ordenado de codigos sugeridos, validados contra cie10_catalogo",
+    "razonamiento_clinico": "Explicacion del modelo",
+    "error": "Mensaje de error cuando ai_status = error",
+    "modelo": "Modelo que genero la sugerencia",
+    "procesado_en": "Cuando se proceso"
+  },
+  "cie10_decision": {
+    "_tabla": "Decision vigente del revisor por diagnostico. Una correccion la actualiza y deja rastro en cie10_decision_historial y en auditoria_evento.",
+    "codigo_traductor": "Diagnostico decidido",
+    "decision": "ACEPTADA (eligio una sugerencia) | RECHAZADA (ingreso otro codigo)",
+    "codigo_final": "Codigo CIE-10 elegido",
+    "codigo_interno_catalogo": "Codigo interno del catalogo correspondiente a codigo_final",
+    "comentario": "Comentario del revisor (motivo del rechazo)",
+    "posicion": "Posicion (desde 1) de la sugerencia aceptada. NULL si se rechazo",
+    "sugerencias_mostradas": "Cuantas sugerencias vio el revisor",
+    "revisor_id": "Subject de Keycloak del revisor",
+    "revisor_nombre": "Nombre del revisor al momento de decidir",
+    "decidido_en": "Timestamp de la decision"
+  },
+  "cie10_decision_historial": {
+    "_tabla": "Historial de decisiones CIE-10 (CREATED / UPDATED). Pensado como append-only, pero hoy congenia_app tiene UPDATE y no tiene trigger de inmutabilidad.",
+    "historial_id": "ID del registro de historial",
+    "codigo_traductor": "Diagnostico afectado (sin FK)",
+    "accion": "CREATED | UPDATED",
+    "decision_anterior": "Decision previa. NULL en CREATED",
+    "decision_nueva": "Decision resultante",
+    "revisor_id": "Subject de Keycloak de quien hizo el cambio",
+    "fecha_evento": "Timestamp del cambio"
+  },
+  "cie10_catalogo": {
+    "_tabla": "Catalogo CIE-10 institucional. El batch lo reemplaza en cada corrida: marca todo inactivo y reactiva lo que viene en el CSV.",
+    "codigo_interno": "ID interno del catalogo del hospital (columna Codigo del CSV)",
+    "codigo": "Codigo CIE-10 oficial (ej: A00.0)",
+    "nombre": "Descripcion del diagnostico",
+    "activo": "FALSE si no vino en el ultimo CSV importado",
+    "importado_en": "Ultima importacion"
+  }
+}

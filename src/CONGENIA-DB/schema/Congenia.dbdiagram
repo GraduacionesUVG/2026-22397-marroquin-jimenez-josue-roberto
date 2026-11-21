@@ -1,0 +1,914 @@
+// ============================================================
+// CONGENIA - Hospital Regional de Coban - Deteccion de enfermedades geneticas
+// Generado desde CONGENIA-M1-SERVER de59065 (2026-10-18), migracion 18_cie10_empty_suggestion_correction.sql
+// No editar a mano: python scripts/sync_from_server.py
+// ============================================================
+
+Project congenia {
+  database_type: 'PostgreSQL'
+  Note: '''
+  Fuente de verdad: CONGENIA-M1-SERVER/db/init/NN_*.sql.
+  El schema `keycloak` (misma instancia RDS) pertenece a Keycloak y no se documenta aqui.
+  '''
+}
+
+
+// ------------------------------------------------------------
+// Usuarios e instituciones
+// ------------------------------------------------------------
+
+Table usuario {
+  usuario_id      uuid          [pk, default: `gen_random_uuid()`, note: 'PK interna']
+  system_id       varchar(50)   [note: 'Sistema externo propietario. NULL si es usuario interno']
+  usuario_ext_id  varchar(50)   [note: 'ID del usuario en el sistema externo. NULL si es interno']
+  nombre          varchar(200)  [not null, note: 'Nombre completo']
+  email           varchar(200)  [note: 'Correo electrónico']
+  especialidad    varchar(50)   [not null, default: 'N/A', note: 'Especialidad del medico. N/A si no aplica']
+  rol             varchar(20)   [not null, note: 'MEDICO | GENETISTA | ADMINISTRADOR | SISTEMA_ANALISIS | READONLY']
+  activo          boolean       [not null, default: true, note: 'Estado del usuario (default: true)']
+  fecha_creacion  timestamptz   [not null, default: `now()`, note: 'Timestamp de creación']
+
+  indexes {
+    (system_id, usuario_ext_id) [name: 'uq_usuario_system_ext', unique]
+  }
+
+  Note: '''
+  Usuarios del sistema con roles diferenciados.
+  '''
+}
+
+Table institucion_tenant {
+  id_tenant           integer       [pk, note: 'ID de la institucion. Igual al atributo tenants del grupo en Keycloak']
+  nombre              varchar(160)  [not null, note: 'Nombre visible de la institucion']
+  activo              boolean       [not null, default: true, note: 'FALSE oculta la institucion en tenantOptions']
+  fecha_creacion      timestamptz   [not null, default: `now()`, note: 'Timestamp de alta']
+  fecha_modificacion  timestamptz   [not null, default: `now()`, note: 'Timestamp de la ultima modificacion']
+
+  Note: '''
+  Instituciones (tenants). Keycloak decide a que tenants accede cada usuario; esta tabla guarda el nombre visible y da integridad referencial.
+  '''
+}
+
+
+// ------------------------------------------------------------
+// Integracion con sistemas externos
+// ------------------------------------------------------------
+
+Table sistema_externo {
+  system_id                varchar(50)   [pk, note: 'Identificador legible del sistema externo. Ej: `SADC-COBAN-SANDBOX`.']
+  nombre                   varchar(200)  [not null, note: 'Nombre descriptivo del sistema externo.']
+  api_key_hash             char(64)      [not null, note: 'SHA-256 del API Key. El key en texto plano nunca se almacena.']
+  auth_method              varchar(20)   [not null, default: 'API_KEY', note: 'API_KEY | OAUTH2 | HYBRID']
+  oauth_client_id          varchar(100)  [note: 'Client ID registrado en el authorization server OAuth 2.0.']
+  oauth_issuer             varchar(300)  [note: 'Issuer esperado del authorization server.']
+  oauth_audience           varchar(100)  [note: 'Audience esperada para tokens destinados a CONGENIA.']
+  activo_oauth             boolean       [not null, default: false, note: 'Permite autenticacion OAuth 2.0 para este sistema externo.']
+  client_secret_hmac_hash  char(64)      [note: 'Solo para flujo intermedio con firma HMAC. NULL en flujo básico.']
+  webhook_callback_url     varchar(500)  [note: 'URL donde CONGENIA notifica cuando una ficha se completa.']
+  activo                   boolean       [not null, default: true, note: 'Si `false`, el sistema no puede iniciar nuevas sesiones. Default: `true`.']
+  fecha_registro           timestamptz   [not null, default: `now()`, note: 'Timestamp de alta del sistema. Default: `now()`.']
+  fecha_ultimo_acceso      timestamptz   [note: 'Se actualiza en cada llamada exitosa al endpoint de integracion.']
+
+  Note: '''
+  Registro de sistemas externos autorizados para iniciar sesiones de integracion en CONGENIA. Esta tabla soporta la migracion controlada desde API Key legado hacia OAuth 2.0 Client Credentials. Durante la transicion, un sistema puede operar en modo `HYBRID`; a futuro el modo esperado para integraciones servidor-a-servidor es `OAUTH2`.
+  '''
+}
+
+Table sistema_externo_permiso {
+  system_id  varchar(50)   [not null, note: 'Sistema externo autorizado. FK a `sistema_externo(system_id)`.']
+  permiso    varchar(100)  [not null, note: 'Scope/permiso interno autorizado para el sistema externo.']
+
+  indexes {
+    (system_id, permiso) [pk]
+  }
+
+  Note: '''
+  Permisos o scopes internos autorizados para cada sistema externo. En el flujo OAuth 2.0, el access token demuestra autenticacion del cliente; esta tabla define que acciones puede ejecutar ese cliente dentro de CONGENIA. Por ejemplo, SADC puede tener permiso `congenia.sessions:init` para iniciar una sesion temporal de ficha, sin recibir permisos administrativos ni acceso a otros modulos.
+  '''
+}
+
+Table sesion_integracion {
+  sesion_id            uuid          [pk, default: `gen_random_uuid()`, note: 'ID interno de la sesion. Default: `gen_random_uuid()`.']
+  system_id            varchar(50)   [not null, note: 'Sistema externo que inicio la sesion. FK a `sistema_externo(system_id)`.']
+  token_hash           char(64)      [not null, unique, note: 'SHA-256 del token entregado al sistema externo. El token real nunca se persiste.']
+  patient_payload_enc  jsonb         [not null, note: 'Payload del sistema externo cifrado en reposo con AES-256-GCM.']
+  ficha_id             uuid          [note: 'NULL mientras la ficha solo existe como sesion temporal. Se asigna cuando se crea la ficha durable. FK a `ficha_clinica(ficha_id)`.']
+  estado               varchar(20)   [not null, default: 'PENDIENTE', note: 'PENDIENTE | ACTIVA | CONSUMIDA | EXPIRADA']
+  expires_at           timestamptz   [not null, note: 'Timestamp de expiracion del token/sesion temporal.']
+  created_at           timestamptz   [not null, default: `now()`, note: 'Timestamp de creacion. Default: `now()`.']
+  activated_at         timestamptz   [note: 'Timestamp de cuando el medico abrio el formulario por primera vez.']
+  consumed_at          timestamptz   [note: 'Timestamp de cuando la ficha paso a estado completa o fue persistida definitivamente.']
+  ip_origen_sadc       varchar(45)   [not null, note: 'IPv4 o IPv6 del sistema externo que realizo la llamada.']
+  nonce                varchar(100)  [unique, note: 'Para flujo intermedio anti-replay. NULL en flujo básico.']
+
+  Note: '''
+  Representa el handshake entre un sistema externo y CONGENIA. Ciclo de vida: `PENDIENTE -> ACTIVA -> CONSUMIDA` o `PENDIENTE -> EXPIRADA`. Con el flujo nuevo, la sesion inicial y el payload de ficha se guardan primero en Redis con llave `integration:{tokenHash}` y TTL corto. PostgreSQL queda como persistencia durable para cuando la ficha se guarde/finalice, para auditoria y para historico. Esta tabla documenta el modelo relacional de sesion de integracion y puede usarse para persistencia durable o trazabilidad adicional si se decide materializar la sesion fuera del cache.
+  '''
+}
+
+Table nonce_usado {
+  nonce       varchar(100)  [pk, note: 'Valor del nonce consumido']
+  system_id   varchar(50)   [not null, note: 'Sistema externo que usó el nonce (FK → `sistema_externo`)']
+  usado_en    timestamptz   [not null, default: `now()`, note: 'Timestamp de uso (servidor, default: now())']
+  expires_at  timestamptz   [not null, note: 'Usado por job de limpieza: DELETE FROM nonce_usado WHERE expires_at < NOW()']
+
+  Note: '''
+  Registro de nonces consumidos para prevenir replay attacks en el flujo intermedio. Requiere job de limpieza periódico.
+  '''
+}
+
+
+// ------------------------------------------------------------
+// Pacientes
+// ------------------------------------------------------------
+
+Table paciente {
+  paciente_id              uuid         [pk, default: `gen_random_uuid()`, note: 'id interno']
+  system_id                varchar(50)  [note: 'Sistema externo propietario. NULL si es paciente creado manualmente']
+  paciente_ext_id          varchar(64)  [note: 'ID del paciente en el sistema externo']
+  nombre_enc               bytea        [not null, note: 'Nombre completo encriptado']
+  nombre_dek_enc           bytea        [not null, note: 'DEK encriptada con clave maestra del proveedor KMS']
+  fecha_creacion_registro  timestamptz  [not null, default: `now()`, note: 'Timestamp de creación (servidor)']
+  ultima_sincronizacion    timestamptz  [note: 'Última vez que se actualizó desde el sistema externo']
+
+  indexes {
+    (system_id, paciente_ext_id) [name: 'uq_paciente_system_ext', unique]
+  }
+
+  Note: '''
+  Información de pacientes con encriptación de datos sensibles.
+  '''
+}
+
+Table paciente_nombre_token {
+  paciente_id  uuid   [not null, note: 'Paciente al que pertenece el token']
+  token_hmac   bytea  [not null, note: 'HMAC-SHA256 de un token del nombre. La llave vive fuera de la base']
+
+  indexes {
+    (paciente_id, token_hmac) [pk]
+    token_hmac [name: 'ix_paciente_nombre_token_hmac']
+  }
+
+  Note: '''
+  Indice ciego para buscar pacientes por nombre sin descifrarlo: un HMAC por cada token normalizado del nombre.
+  '''
+}
+
+
+// ------------------------------------------------------------
+// Fichas clinicas
+// ------------------------------------------------------------
+
+Table ficha_clinica {
+  ficha_id                uuid          [pk, default: `gen_random_uuid()`, note: 'PK interna, nunca expuesta al sistema externo']
+  paciente_id             uuid          [not null, note: 'Paciente de la ficha']
+  sesion_id               uuid          [note: 'FK a sesion_integracion. NULL si creación manual.']
+  origen_creacion         varchar(20)   [not null, default: 'MANUAL', note: 'INTEGRACION | MANUAL']
+  ultimo_autosave         timestamptz   [note: 'NULL si nunca se hizo autosave desde la creación']
+  medico_id               uuid          [not null, note: 'proveniente de sistema externo']
+  fecha_consulta          date          [not null, note: 'Fecha de la consulta']
+  diagnosticos_ext_texto  text          [note: 'Texto libre proveniente del sistema externo — fuente para el modelo de data oscura']
+  estado_ficha            varchar(20)   [not null, default: 'BORRADOR', note: 'BORRADOR | COMPLETA | VALIDADA | ARCHIVADA']
+  version_ficha           smallint      [not null, default: 1, note: 'version de la ficha del sistema interno']
+  fecha_creacion          timestamptz   [not null, default: `now()`, note: 'Timestamp de creación']
+  fecha_modificacion      timestamptz   [note: 'Timestamp última modificación']
+  creado_por              uuid          [not null, note: 'ID del usuario que creó (del sistema interno)']
+  modificado_por          uuid          [note: 'ID del usuario que modificó']
+  historia_clinica        varchar(64)   [not null, note: 'Numero de historia clinica del paciente en la institucion. Se busca junto con id_tenant']
+  id_tenant               integer       [not null, note: 'Institucion duena de la ficha. El acceso a cada tenant lo otorga Keycloak']
+  ficha_raiz_id           uuid          [not null, note: 'Primera version de la ficha. Todas las adendas apuntan a ella (en la original es su propio ficha_id)']
+  es_vigente              boolean       [not null, default: true, note: 'TRUE en la version que se muestra. Indice unico parcial: una vigente por ficha_raiz_id']
+  motivo_solicitud        varchar(500)  [note: 'Motivo con el que el medico solicito la adenda']
+  motivo_rechazo          varchar(500)  [note: 'Motivo del revisor al rechazar la adenda']
+  estado_revision         varchar(16)   [note: 'NULL en la version original. PENDIENTE | APROBADA | RECHAZADA en las adendas']
+  fecha_resolucion        timestamptz   [note: 'Cuando el revisor aprobo o rechazo la adenda']
+  resuelta_por            uuid          [note: 'Revisor que resolvio la adenda']
+
+  indexes {
+    (id_tenant, estado_revision, `fecha_creacion DESC`) [name: 'ix_ficha_adendas_tenant_estado_fecha', note: 'WHERE estado_revision IS NOT NULL']
+    (ficha_raiz_id, `version_ficha DESC`) [name: 'ix_ficha_raiz_version']
+    (id_tenant, `fecha_consulta DESC`) [name: 'ix_ficha_tenant_fecha']
+    (id_tenant, historia_clinica) [name: 'ix_ficha_tenant_historia']
+    ficha_raiz_id [name: 'ux_ficha_raiz_vigente', unique, note: 'WHERE es_vigente']
+    (id_tenant, historia_clinica) [name: 'ux_ficha_vigente_por_hc', unique, note: 'WHERE es_vigente']
+  }
+
+  Note: '''
+  Version de una ficha clinica. La ficha inicial y cada adenda son filas distintas que comparten ficha_raiz_id; solo una por raiz es vigente.
+  CHECK ck_ficha_estado_revision: (estado_revision IS NULL OR (estado_revision = ANY ('PENDIENTE', 'APROBADA', 'RECHAZADA')))
+  '''
+}
+
+Table datos_adicionales_ficha {
+  ficha_id                uuid         [pk, note: 'Referencia a ficha clínica']
+  referido_de_id          smallint     [note: 'Fuente de referencia (FK → `referido_de`)']
+  asistencia_parto_id     smallint     [note: 'Tipo de asistencia en parto (FK → `asistencia_parto`)']
+  familiares_afectos      boolean      [not null, default: false, note: 'Indicador de familiares con condiciones similares']
+  personas_hogar_menores  smallint     [default: 0, note: 'Cantidad de menores en el hogar (default: 0)']
+  personas_hogar_adultos  smallint     [default: 0, note: 'Cantidad de adultos en el hogar (default: 0)']
+  comunidad_afectada      varchar(20)  [note: 'SI | NO | DESCONOCIDO']
+  sexo_id                 smallint     [note: 'Sexo del paciente']
+
+  Note: '''
+  Información adicional y contextual de fichas clínicas (condiciones sociales y médicas).
+  '''
+}
+
+Table familiar_afectado {
+  familiar_afectado_id  uuid      [pk, default: `gen_random_uuid()`, note: 'ID único del registro']
+  ficha_id              uuid      [not null, note: 'Referencia a ficha clínica']
+  familiar_catalogo_id  smallint  [not null, note: 'Tipo de relación familiar (FK → `familiar_catalogo`)']
+
+  Note: '''
+  Registro de familiares con historial de condiciones similares a la del paciente.
+  '''
+}
+
+Table signo_alerta_ficha {
+  signo_id            uuid          [pk, default: `gen_random_uuid()`, note: 'ID único del registro']
+  ficha_id            uuid          [not null, note: 'Referencia a ficha clínica']
+  signo_texto_libre   varchar(300)  [not null, note: 'Texto libre ingresado por el médico']
+  parte_id            smallint      [not null, note: 'Parte del cuerpo afectada (FK → `parte_del_cuerpo`)']
+  imagen_bucket_ref   varchar(500)  [note: 'Referencia al archivo en bucket de almacenamiento']
+  imagen_hash_sha256  char(64)      [note: 'Integridad del archivo en bucket']
+  fecha_registro      timestamptz   [not null, default: `now()`, note: 'Timestamp de registro (servidor)']
+  registrado_por      uuid          [not null, note: 'ID del usuario que registró (FK → `usuario`)']
+  added_in_revision   boolean       [not null, default: false, note: 'TRUE si el signo se agrego en una adenda']
+  replaces_signo_id   uuid          [note: 'Signo de la version anterior que este reemplaza. NULL si es nuevo']
+
+  Note: '''
+  Signos de alerta registrados en la ficha clínica mediante texto libre, con referencia a la parte del cuerpo afectada y evidencia fotográfica opcional.
+  '''
+}
+
+Table examen_ficha {
+  examen_ficha_id     uuid          [pk, default: `gen_random_uuid()`, note: 'ID único del registro']
+  ficha_id            uuid          [not null, note: 'Referencia a ficha clínica']
+  examen_texto_libre  varchar(300)  [not null, note: 'Texto libre ingresado por el médico']
+  imagen_bucket_ref   varchar(500)  [note: 'Referencia al archivo en bucket']
+  imagen_hash_sha256  char(64)      [note: 'Hash SHA-256 para integridad']
+  fecha_registro      timestamptz   [not null, default: `now()`, note: 'Timestamp de registro (servidor)']
+  registrado_por      uuid          [not null, note: 'ID del usuario (FK → `usuario`)']
+  added_in_revision   boolean       [not null, default: false, note: 'TRUE si el examen se agrego en una adenda']
+  replaces_examen_id  uuid          [note: 'Examen de la version anterior que este reemplaza. NULL si es nuevo']
+
+  Note: '''
+  Exámenes realizados en la ficha, descritos mediante texto libre por el médico.
+  '''
+}
+
+Table observacion_ficha {
+  observacion_id        uuid         [pk, default: `gen_random_uuid()`, note: 'ID de la observacion']
+  ficha_id              uuid         [not null, note: 'Version de la ficha en la que se registro']
+  texto_enc             bytea        [not null, note: 'Texto cifrado con la DEK']
+  texto_dek_enc         bytea        [not null, note: 'DEK cifrada con la clave maestra']
+  agregada_en_revision  boolean      [not null, default: false, note: 'TRUE si la observacion vino en una adenda']
+  fecha_creacion        timestamptz  [not null, default: `now()`, note: 'Timestamp de creacion']
+  usuario_id            uuid         [not null, note: 'Autor de la observacion']
+
+  indexes {
+    (ficha_id, fecha_creacion, observacion_id) [name: 'ix_observacion_ficha_fecha']
+  }
+
+  Note: '''
+  Observaciones en texto libre de una ficha, cifradas en reposo con cifrado de sobre (DEK por registro).
+  '''
+}
+
+Table resultado_ia {
+  resultado_id          uuid          [pk, default: `gen_random_uuid()`, note: 'ID único del resultado']
+  ficha_id              uuid          [not null, note: 'Referencia a ficha clínica']
+  ejecutado_por         uuid          [not null, note: 'ID del usuario/sistema que ejecutó el modelo (FK → `usuario`)']
+  modelo_utilizado      varchar(100)  [note: 'Nombre del modelo IA utilizado']
+  version_modelo        varchar(50)   [not null, note: 'Versión específica del modelo']
+  resultado_raw         jsonb         [not null, note: 'Response completo de la API. Inmutable.']
+  es_resultado_vigente  boolean       [not null, default: true, note: 'Partial unique index garantiza solo uno TRUE por ficha']
+  ejecutado_en          timestamptz   [not null, default: `now()`, note: 'Timestamp de ejecución (servidor)']
+
+  Note: '''
+  Resultado de modelo IA ejecutados sobre las fichas clínicas.
+  '''
+}
+
+Table ficha_provisional {
+  ficha_raiz_id                 uuid         [pk, note: 'Ficha raiz provisional. Cubre todas sus versiones y adendas.']
+  id_tenant                     integer      [not null, note: 'Institucion. Igual al id_tenant de la ficha raiz (lo valida el trigger).']
+  historia_clinica_referida     varchar(48)  [not null, note: 'HC que escribio el medico y no existio en SADC. El batch de consolidacion la vuelve a buscar.']
+  historia_clinica_provisional  varchar(64)  [not null, note: 'TMP-<id_tenant>-<historia_clinica_referida>. Igual a ficha_clinica.historia_clinica de la raiz.']
+  estado                        varchar(20)  [not null, default: 'PENDIENTE', note: 'PENDIENTE | EN_REVISION (adenda de consolidacion creada) | CONSOLIDADA | DESCARTADA']
+  creado_por                    uuid         [not null, note: 'Medico que registro la ficha provisional']
+  fecha_creacion                timestamptz  [not null, default: `now()`, note: 'Momento en que se registro la ficha provisional']
+  intentos_consolidacion        smallint     [not null, default: 0, note: 'Veces que el batch consulto SADC sin encontrar la HC']
+  ultimo_intento                timestamptz  [note: 'Ultima consulta del batch a SADC']
+  ficha_consolidada_id          uuid         [note: 'Version (adenda) de la misma ficha raiz que lleva la HC real']
+  historia_clinica_real         varchar(64)  [note: 'HC encontrada en SADC al consolidar']
+  resuelto_por                  uuid         [note: 'Revisor que aprobo o descarto la consolidacion']
+  fecha_resolucion              timestamptz  [note: 'Momento en que la consolidacion se aprobo o se descarto']
+
+  indexes {
+    ultimo_intento [name: 'ix_ficha_provisional_cola', note: 'WHERE estado::text = \'PENDIENTE\'::text']
+    (id_tenant, estado, `fecha_creacion DESC`) [name: 'ix_ficha_provisional_tenant_estado']
+    (id_tenant, historia_clinica_referida) [name: 'ux_ficha_provisional_activa_hc', unique, note: 'WHERE estado::text = ANY (ARRAY[\'PENDIENTE\'::character varying, \'EN_REVISION\'::character varying]::text[])']
+  }
+
+  Note: '''
+  Ficha raiz registrada con historia clinica provisional (TMP-) porque la HC no existe en SADC. Una fila por ficha raiz.
+  CHECK ck_ficha_provisional_adenda: ((estado <> ALL ('EN_REVISION', 'CONSOLIDADA')) OR ficha_consolidada_id IS NOT NULL AND historia_clinica_real IS NOT NULL)
+  CHECK ck_ficha_provisional_estado: (estado = ANY ('PENDIENTE', 'EN_REVISION', 'CONSOLIDADA', 'DESCARTADA'))
+  CHECK ck_ficha_provisional_formato: (historia_clinica_provisional = ((('TMP-' || id_tenant) || '-') || historia_clinica_referida))
+  CHECK ck_ficha_provisional_intentos: (intentos_consolidacion >= 0)
+  CHECK ck_ficha_provisional_real: (historia_clinica_real IS NULL OR upper(historia_clinica_real) !~~ 'TMP-%')
+  CHECK ck_ficha_provisional_referida: (historia_clinica_referida ~ '^[A-Za-z0-9-]+$' AND upper(historia_clinica_referida) !~~ 'TMP-%')
+  CHECK ck_ficha_provisional_resolucion: ((estado = ANY ('CONSOLIDADA', 'DESCARTADA')) = (resuelto_por IS NOT NULL AND fecha_resolucion IS NOT NULL))
+  TRIGGER trg_ficha_provisional_no_truncate -> ficha_provisional_no_truncate()
+  TRIGGER trg_ficha_provisional_validar -> ficha_provisional_validar()
+  '''
+}
+
+
+// ------------------------------------------------------------
+// Consentimiento informado
+// ------------------------------------------------------------
+
+Table consentimiento {
+  consentimiento_id        uuid          [pk, default: `gen_random_uuid()`, note: 'ID único']
+  ficha_id                 uuid          [not null, unique, note: 'Referencia única a ficha (1 consentimiento por ficha)']
+  medico_id                uuid          [not null, note: 'Médico responsable (FK → `usuario`)']
+  tipo_firmante            varchar(50)   [not null, note: 'PADRE | MADRE | TUTOR | REPRESENTANTE_LEGAL']
+  nombre_firmante          varchar(200)  [note: 'Nombre del firmante']
+  idioma_consentimiento    varchar(20)   [not null, note: 'ESPANOL | QEQCHI | IXIL']
+  aceptacion_terminos      boolean       [not null, note: 'Siempre TRUE para persistir. Constraint a nivel de app y BD.']
+  aceptacion_contacto      boolean       [note: 'Acepta ser contactado para seguimiento. Opcional']
+  fecha_hora_aceptacion    timestamptz   [not null, note: 'NTP del servidor. Nunca hora del cliente.']
+  firma_evidencia_tecnica  jsonb         [not null, note: 'Metadatos de la captura (timestamp, userAgent, canvasHash, version legal) y declaraciones aceptadas. Nunca la imagen ni el trazo de la firma.']
+  firma_png_ref            varchar(500)  [note: 'Clave S3 del PNG de la firma, en el bucket de documentos.']
+  pdf_ref                  varchar(500)  [note: 'Referencia a PDF del consentimiento en bucket']
+  pdf_hash_sha256          char(64)      [not null, note: 'Hash SHA-256 del PDF']
+  firma_png_hash_sha256    char(64)      [not null, note: 'SHA-256 de los bytes del PNG de la firma. El worker lo verifica antes de generar el PDF.']
+  json_hash_sha256         char(64)      [not null, note: 'SHA-256 de firma_evidencia_tecnica serializada como JSON canonico (claves ordenadas, sin espacios).']
+  ip_dispositivo           varchar(45)   [not null, note: 'IPv4 o IPv6']
+  session_id               varchar(100)  [note: 'ID de sesión de la firma']
+  estado_consentimiento    varchar(20)   [not null, default: 'VIGENTE', note: 'VIGENTE | ANULADO']
+  anulado_por_id           uuid          [note: 'ID del usuario que anuló (FK → `usuario`)']
+  fecha_anulacion          timestamptz   [note: 'Timestamp de anulación']
+
+  Note: '''
+  Registro legal de consentimiento informado con firma electrónica y evidencia técnica.
+  CHECK chk_evidencia_sin_png: (NOT firma_evidencia_tecnica ? 'firmaBase64') NOT VALID
+  '''
+}
+
+
+// ------------------------------------------------------------
+// Auditoria y control de cambios
+// ------------------------------------------------------------
+
+Table auditoria_evento {
+  evento_id              uuid          [pk, default: `gen_random_uuid()`, note: 'ID único del evento']
+  usuario_id             uuid          [note: 'NULL si el evento es previo a autenticación']
+  tipo_evento            varchar(50)   [not null, note: 'FK a tipo_evento_catalogo']
+  entidad_tipo           varchar(50)   [note: 'Ficha | Consentimiento | Signo | Examen | Sesion']
+  entidad_id             uuid          [note: 'ID del objeto afectado']
+  ip_origen              varchar(45)   [not null, note: 'IPv4 o IPv6 de origen']
+  user_agent             varchar(500)  [note: 'User-Agent del navegador/cliente']
+  session_id             varchar(100)  [note: 'ID de sesión']
+  fecha_hora             timestamptz   [not null, default: `now()`, note: 'Timestamp NTP del servidor']
+  resultado              varchar(20)   [not null, note: 'EXITOSO | FALLIDO | DENEGADO']
+  detalle_json           jsonb         [note: 'Contexto adicional estructurado por tipo de evento']
+  hash_entrada_anterior  char(64)      [note: 'hash_entrada_actual de la fila con la secuencia previa. Genesis: 64 ceros']
+  hash_entrada_actual    char(64)      [not null, note: 'auditoria_evento_hash(fila): SHA-256 de los campos canonicos + hash_entrada_anterior']
+  secuencia              bigint        [not null, note: 'Orden total de la cadena. Lo asigna el trigger, no la aplicacion']
+  actor_sub              varchar(100)  [note: 'Subject de Keycloak, client:<system_id> o system:<servicio>']
+  actor_username         varchar(200)  [note: 'Username de Keycloak, o ID del medico externo en sesiones de integracion']
+  actor_roles            "text[]"      [note: 'Roles del token al momento del evento']
+  id_tenant              integer       [note: 'Institucion afectada cuando el evento toca un paciente']
+  http_method            varchar(10)   [note: 'Metodo HTTP de la peticion']
+  ruta                   varchar(300)  [note: 'Plantilla de la ruta (ej: /api/v1/fichas/:id), nunca la URL con identificadores']
+  status_code            smallint      [note: 'Codigo HTTP de la respuesta']
+  request_id             varchar(100)  [note: 'X-Request-Id para correlacionar con los logs de la aplicacion']
+
+  indexes {
+    fecha_hora [name: 'brin_auditoria_fecha', note: 'BRIN']
+    (actor_sub, fecha_hora) [name: 'ix_auditoria_actor_fecha']
+    (entidad_tipo, entidad_id, fecha_hora) [name: 'ix_auditoria_entidad_fecha']
+    (tipo_evento, fecha_hora) [name: 'ix_auditoria_tipo_fecha']
+    secuencia [name: 'ux_auditoria_secuencia', unique]
+  }
+
+  Note: '''
+  Bitacora de auditoria append-only con cadena de hashes. Un trigger asigna secuencia y hashes; otros bloquean UPDATE, DELETE y TRUNCATE. Verificacion: SELECT * FROM verificar_cadena_auditoria().
+  TRIGGER trg_auditoria_evento_encadenar -> auditoria_evento_encadenar()
+  TRIGGER trg_auditoria_evento_inmutable -> bloquear_modificacion_auditoria()
+  TRIGGER trg_auditoria_evento_no_truncate -> bloquear_modificacion_auditoria()
+  '''
+}
+
+Table tipo_evento_catalogo {
+  codigo       varchar(50)   [pk, note: 'Codigo del evento (ej: FICHA_LEIDA)']
+  categoria    varchar(20)   [not null, note: 'ACCESO | CONSULTA | MODIFICACION | VALIDACION | INTEGRACION | ARCHIVO | CATALOGO']
+  descripcion  varchar(300)  [not null, note: 'Que representa el evento']
+
+  Note: '''
+  Catalogo cerrado de tipos de evento. auditoria_evento.tipo_evento tiene FK aqui: un tipo nuevo se registra en la misma migracion que lo introduce.
+  '''
+}
+
+Table ficha_cambio {
+  cambio_id         uuid          [pk, default: `gen_random_uuid()`, note: 'ID único del cambio']
+  ficha_id          uuid          [not null, note: 'Referencia a ficha clínica (FK → `ficha_clinica`)']
+  usuario_id        uuid          [not null, note: 'Usuario que realizó el cambio (FK → `usuario`)']
+  campo_modificado  varchar(100)  [note: 'Nombre del campo que cambió']
+  valor_anterior    text          [note: 'Encriptado en reposo']
+  valor_nuevo       text          [note: 'Encriptado en reposo']
+  justificacion     varchar(500)  [note: 'Razón del cambio']
+  fecha_hora        timestamptz   [not null, default: `now()`, note: 'Timestamp del cambio (servidor)']
+  ip_origen         varchar(45)   [not null, note: 'IPv4 o IPv6 de origen']
+
+  indexes {
+    (ficha_id, fecha_hora) [name: 'ix_ficha_cambio_ficha_fecha']
+  }
+
+  Note: '''
+  Historial de cambios específicos en campos de fichas clínicas con encriptación.
+  TRIGGER trg_ficha_cambio_inmutable -> bloquear_modificacion_auditoria()
+  TRIGGER trg_ficha_cambio_no_truncate -> bloquear_modificacion_auditoria()
+  '''
+}
+
+
+// ------------------------------------------------------------
+// Correccion CIE-10
+// ------------------------------------------------------------
+
+Table cie10_run {
+  run_id                 uuid          [pk, default: `gen_random_uuid()`, note: 'ID de la corrida']
+  estado                 varchar(20)   [not null, default: 'RUNNING', note: 'RUNNING | COMPLETED | FAILED']
+  source_catalog_uri     text          [not null, note: 'Ruta local o s3:// del CSV del catalogo usado']
+  source_translator_uri  text          [not null, note: 'Ruta local o s3:// del CSV de diagnosticos (traductor) usado']
+  model                  varchar(100)  [not null, note: 'Modelo de OpenAI usado']
+  prompt_version         varchar(50)   [not null, note: 'Version del prompt del sistema']
+  max_records            integer       [note: 'Limite de registros procesados. NULL = sin limite']
+  processed_count        integer       [not null, default: 0, note: 'Registros procesados']
+  suggestion_count       integer       [not null, default: 0, note: 'Registros con sugerencias validas']
+  error_count            integer       [not null, default: 0, note: 'Registros que fallaron']
+  started_at             timestamptz   [not null, default: `now()`, note: 'Inicio de la corrida']
+  finished_at            timestamptz   [note: 'Fin de la corrida']
+  metadata_json          jsonb         [not null, default: '{}', note: 'Metadatos adicionales de la corrida']
+  input_tokens           bigint        [not null, default: 0, note: 'Tokens de entrada enviados al modelo en la corrida']
+  cached_input_tokens    bigint        [not null, default: 0, note: 'Tokens de entrada servidos desde cache en la corrida']
+  output_tokens          bigint        [not null, default: 0, note: 'Tokens de salida del modelo en la corrida']
+  reasoning_tokens       bigint        [not null, default: 0, note: 'Tokens de razonamiento del modelo en la corrida']
+  total_tokens           bigint        [not null, default: 0, note: 'Total de tokens consumidos en la corrida']
+  api_call_count         integer       [not null, default: 0, note: 'Llamadas a la API del modelo en la corrida']
+  rag_version            varchar(80)   [note: 'Version del corpus RAG usada en la corrida']
+  periodo                char(7)       [note: 'Mes revisado (YYYY-MM). Agrupa el lote mensual que confirma el revisor']
+
+  indexes {
+    (`periodo DESC`, estado, `finished_at DESC`) [name: 'ix_cie10_run_periodo_estado']
+  }
+
+  Note: '''
+  Una ejecucion del batch mensual CIE-10 (CONGENIA-CIE10).
+  CHECK cie10_run_estado_check: (estado = ANY ('RUNNING', 'COMPLETED', 'FAILED'))
+  CHECK cie10_run_periodo_chk: (periodo IS NULL OR periodo ~ '^\d{4}-(0[1-9]|1[0-2])$')
+  '''
+}
+
+Table cie10_sugerencia {
+  codigo_traductor      varchar       [pk, note: 'ID del registro en el CSV del traductor']
+  run_id                uuid          [not null, note: 'Corrida que genero la sugerencia']
+  diagnostico           text          [not null, note: 'Texto libre del diagnostico de emergencia. Puede contener datos clinicos sensibles y se envia a OpenAI']
+  cie10_original        varchar       [note: 'Codigo interno asignado originalmente en el traductor']
+  ai_status             varchar(40)   [not null, default: 'suggestions', note: 'suggestions | insufficient_information | error']
+  sugerencias           jsonb         [not null, default: '[]', note: 'Arreglo JSON ordenado de codigos sugeridos, validados contra cie10_catalogo']
+  razonamiento_clinico  text          [note: 'Explicacion del modelo']
+  error                 text          [note: 'Mensaje de error cuando ai_status = error']
+  modelo                varchar(100)  [not null, note: 'Modelo que genero la sugerencia']
+  procesado_en          timestamptz   [not null, default: `now()`, note: 'Cuando se proceso']
+  input_tokens          bigint        [not null, default: 0, note: 'Tokens de entrada enviados al modelo para este registro']
+  cached_input_tokens   bigint        [not null, default: 0, note: 'Tokens de entrada servidos desde cache para este registro']
+  output_tokens         bigint        [not null, default: 0, note: 'Tokens de salida del modelo para este registro']
+  reasoning_tokens      bigint        [not null, default: 0, note: 'Tokens de razonamiento del modelo para este registro']
+  total_tokens          bigint        [not null, default: 0, note: 'Total de tokens consumidos para este registro']
+  api_call_count        integer       [not null, default: 0, note: 'Llamadas a la API del modelo para este registro']
+  rag_version           varchar(80)   [note: 'Version del corpus RAG usada para sugerir']
+  input_sha256          char(64)      [note: 'SHA-256 de la entrada enviada al modelo']
+
+  indexes {
+    (procesado_en, codigo_traductor) [name: 'ix_cie10_sugerencia_orden']
+  }
+
+  Note: '''
+  Diagnostico pendiente de clasificar con las sugerencias de la IA. Una fila por registro del traductor; es la cola del dashboard.
+  CHECK cie10_sugerencia_ai_status_check: (ai_status = ANY ('suggestions', 'insufficient_information', 'error'))
+  '''
+}
+
+Table cie10_decision {
+  codigo_traductor         varchar       [pk, note: 'Diagnostico decidido']
+  decision                 varchar(10)   [not null, note: 'ACEPTADA (eligio una sugerencia) | RECHAZADA (ingreso otro codigo)']
+  codigo_final             varchar(8)    [not null, note: 'Codigo CIE-10 elegido']
+  codigo_interno_catalogo  varchar       [note: 'Codigo interno del catalogo correspondiente a codigo_final']
+  comentario               varchar(300)  [note: 'Comentario del revisor (motivo del rechazo)']
+  posicion                 smallint      [note: 'Posicion (desde 1) de la sugerencia aceptada. NULL si se rechazo']
+  sugerencias_mostradas    smallint      [not null, note: 'Cuantas sugerencias vio el revisor']
+  revisor_id               varchar       [not null, note: 'Subject de Keycloak del revisor']
+  revisor_nombre           varchar(200)  [not null, note: 'Nombre del revisor al momento de decidir']
+  decidido_en              timestamptz   [not null, default: `now()`, note: 'Timestamp de la decision']
+
+  indexes {
+    (revisor_id, `decidido_en DESC`) [name: 'ix_cie10_decision_revisor_fecha']
+  }
+
+  Note: '''
+  Decision vigente del revisor por diagnostico. Una correccion la actualiza y deja rastro en cie10_decision_historial y en auditoria_evento.
+  CHECK cie10_decision_decision_check: (decision = ANY ('ACEPTADA', 'RECHAZADA'))
+  '''
+}
+
+Table cie10_decision_historial {
+  historial_id       uuid         [pk, default: `gen_random_uuid()`, note: 'ID del registro de historial']
+  codigo_traductor   varchar      [not null, note: 'Diagnostico afectado (sin FK)']
+  accion             varchar(20)  [not null, note: 'CREATED | UPDATED']
+  decision_anterior  jsonb        [note: 'Decision previa. NULL en CREATED']
+  decision_nueva     jsonb        [not null, note: 'Decision resultante']
+  revisor_id         varchar      [not null, note: 'Subject de Keycloak de quien hizo el cambio']
+  fecha_evento       timestamptz  [not null, default: `now()`, note: 'Timestamp del cambio']
+
+  indexes {
+    (codigo_traductor, `fecha_evento DESC`) [name: 'ix_cie10_decision_historial_item']
+  }
+
+  Note: '''
+  Historial de decisiones CIE-10 (CREATED / UPDATED). Pensado como append-only, pero hoy congenia_app tiene UPDATE y no tiene trigger de inmutabilidad.
+  CHECK cie10_decision_historial_accion_check: (accion = ANY ('CREATED', 'UPDATED'))
+  '''
+}
+
+Table cie10_catalogo {
+  codigo_interno  varchar      [pk, note: 'ID interno del catalogo del hospital (columna Codigo del CSV)']
+  codigo          varchar(8)   [not null, unique, note: 'Codigo CIE-10 oficial (ej: A00.0)']
+  nombre          text         [not null, note: 'Descripcion del diagnostico']
+  activo          boolean      [not null, default: true, note: 'FALSE si no vino en el ultimo CSV importado']
+  importado_en    timestamptz  [not null, default: `now()`, note: 'Ultima importacion']
+
+  Note: '''
+  Catalogo CIE-10 institucional. El batch lo reemplaza en cada corrida: marca todo inactivo y reactiva lo que viene en el CSV.
+  '''
+}
+
+Table cie10_revision_item {
+  run_id                 uuid          [not null, note: 'Corrida (lote) revisada']
+  codigo_traductor       varchar       [not null, note: 'Registro del traductor']
+  codigo_final           varchar(8)    [not null, note: 'Codigo CIE-10 elegido en el borrador']
+  comentario             varchar(300)  [note: 'Comentario del revisor (hasta 300 caracteres)']
+  corregido              boolean       [not null, default: false, note: 'TRUE si el revisor ingreso otro codigo; FALSE si acepto una sugerencia']
+  revisor_id             varchar       [not null, note: 'Subject de Keycloak del revisor']
+  updated_at             timestamptz   [not null, default: `now()`, note: 'Ultima modificacion del borrador']
+  posicion               smallint      [note: 'Posicion (1 a 5) de la sugerencia aceptada. NULL si se corrigio']
+  sugerencias_mostradas  smallint      [note: 'Cuantas sugerencias vio el revisor (0 a 5; 0 si la IA se abstuvo)']
+
+  indexes {
+    (run_id, codigo_traductor) [pk]
+    (run_id, codigo_traductor) [name: 'ix_cie10_revision_item_run']
+  }
+
+  Note: '''
+  Borrador de la revision de un lote: decision preliminar por registro antes de la confirmacion masiva.
+  CHECK cie10_revision_item_selection_chk: (corregido = true AND posicion IS NULL AND (sugerencias_mostradas IS NULL OR sugerencias_mostradas >= 0 AND sugerencias_mostradas <= 5) OR corregido = false AND posicion >= 1 AND posicion <= 5 AND sugerencias_mostradas >= posicion AND sugerencias_mostradas <= 5)
+  '''
+}
+
+Table cie10_lote_confirmacion {
+  run_id            uuid         [pk, note: 'Corrida (lote)']
+  clausula_version  varchar(40)  [not null, note: 'Clausula aceptada']
+  aceptada_por      varchar      [not null, note: 'Subject de Keycloak de quien acepto la clausula']
+  aceptada_en       timestamptz  [not null, default: `now()`, note: 'Cuando se acepto la clausula']
+  confirmada_por    varchar      [note: 'Subject de Keycloak de quien confirmo el lote. NULL mientras no se confirme']
+  confirmada_en     timestamptz  [note: 'Cuando se confirmo el lote']
+  total_registros   integer      [note: 'Registros confirmados']
+  csv_object_key    text         [note: 'Clave del CSV exportado del lote en el almacenamiento de objetos']
+  csv_sha256        char(64)     [note: 'SHA-256 del CSV exportado']
+
+  Note: '''
+  Aceptacion de la clausula y confirmacion masiva de un lote CIE-10. Una fila por corrida.
+  '''
+}
+
+Table cie10_clausula {
+  version     varchar(40)  [pk, note: 'Identificador de la clausula']
+  texto       text         [not null, note: 'Texto que acepta el revisor']
+  activa      boolean      [not null, default: false, note: 'TRUE en la clausula vigente. Indice unico parcial: una sola activa']
+  created_at  timestamptz  [not null, default: `now()`, note: 'Creacion de la clausula']
+
+  indexes {
+    activa [name: 'ux_cie10_clausula_activa', unique, note: 'WHERE activa = true']
+  }
+
+  Note: '''
+  Clausulas que el revisor acepta antes de revisar un lote CIE-10 asistido por IA. Solo una activa.
+  '''
+}
+
+Table cie10_rag_version {
+  rag_version           varchar(80)   [pk, note: 'Identificador de la version']
+  estado                varchar(20)   [not null, default: 'BUILDING', note: 'BUILDING | READY | ACTIVE | FAILED | ARCHIVED. Indice unico parcial: una sola ACTIVE']
+  institutional_sha256  char(64)      [not null, note: 'SHA-256 del CSV del catalogo institucional usado']
+  reference_sha256      char(64)      [note: 'SHA-256 de la referencia CIE-10 externa usada. NULL si no se uso']
+  reference_commit      varchar(64)   [note: 'Commit de la referencia externa usada']
+  embedding_model       varchar(100)  [not null, note: 'Modelo de embeddings']
+  embedding_dimensions  integer       [not null, note: 'Dimensiones de los vectores (1 a 4096)']
+  vector_count          integer       [not null, default: 0, note: 'Vectores generados']
+  metadata_json         jsonb         [not null, default: '{}', note: 'Metadatos de la construccion']
+  created_at            timestamptz   [not null, default: `now()`, note: 'Inicio de la construccion']
+  activated_at          timestamptz   [note: 'Cuando paso a ACTIVE']
+
+  indexes {
+    estado [name: 'ux_cie10_rag_active', unique, note: 'WHERE estado::text = \'ACTIVE\'::text']
+  }
+
+  Note: '''
+  Version del corpus RAG de CIE-10 (catalogo institucional + referencia externa) con sus embeddings. Solo una puede estar ACTIVE.
+  CHECK cie10_rag_version_embedding_dimensions_check: (embedding_dimensions >= 1 AND embedding_dimensions <= 4096)
+  CHECK cie10_rag_version_estado_check: (estado = ANY ('BUILDING', 'READY', 'ACTIVE', 'FAILED', 'ARCHIVED'))
+  '''
+}
+
+Table cie10_rag_catalogo {
+  rag_version                 varchar(80)   [not null, note: 'Version del corpus']
+  codigo                      varchar(8)    [not null, note: 'Codigo CIE-10']
+  descripcion                 text          [not null, note: 'Nombre institucional, o el de la referencia si no esta en el catalogo']
+  codigo_interno              varchar       [note: 'Codigo interno del catalogo institucional. NULL si solo esta en la referencia']
+  en_catalogo_institucional   boolean       [not null, note: 'TRUE si el codigo existe en el catalogo institucional']
+  en_referencia_externa       boolean       [not null, note: 'TRUE si el codigo existe en la referencia CIE-10 externa']
+  descripcion_normalizada     text          [note: 'descripcion en minusculas y sin tildes, para busqueda']
+  nivel                       smallint      [note: 'Nivel jerarquico del codigo en la CIE-10']
+  parent_codigo               varchar(8)    [note: 'Codigo padre en la jerarquia']
+  ancestros                   jsonb         [not null, default: '[]', note: 'Arreglo JSON de codigos ancestros']
+  source                      varchar(120)  [note: 'Origen del registro (catalogo institucional o referencia)']
+  texto_busqueda_normalizado  text          [note: 'Nombre, descripcion de referencia y jerarquia normalizados; corpus de la busqueda lexica hibrida']
+
+  indexes {
+    (rag_version, codigo) [pk]
+    codigo [name: 'ix_cie10_rag_catalogo_codigo']
+    (rag_version, descripcion_normalizada) [name: 'ix_cie10_rag_catalogo_descripcion']
+    (rag_version, parent_codigo) [name: 'ix_cie10_rag_catalogo_parent']
+  }
+
+  Note: '''
+  Codigos CIE-10 del corpus RAG de una version. Se reemplaza completo al reconstruir la version.
+  '''
+}
+
+
+// ------------------------------------------------------------
+// Catalogos
+// ------------------------------------------------------------
+
+Table signo_catalogo {
+  signo_catalogo_id   serial        [pk, increment, note: 'ID numérico único']
+  nombre_normalizado  varchar(200)  [not null, note: 'Nombre normalizado del signo']
+  categoria           varchar(100)  [note: 'Categoría médica del signo']
+  descripcion_medica  text          [note: 'Descripción clínica detallada']
+  activo              boolean       [not null, default: true, note: 'Indicador de disponibilidad (default: true)']
+  fecha_creacion      timestamptz   [not null, default: `now()`, note: 'Timestamp de creación']
+
+  Note: '''
+  Catálogo centralizado de signos de alerta disponibles en el sistema.
+  '''
+}
+
+Table examen_catalogo {
+  examen_catalogo_id  serial        [pk, increment, note: 'ID numérico único']
+  nombre_normalizado  varchar(200)  [not null, note: 'Nombre normalizado del examen']
+  tipo                varchar(50)   [note: 'GENETICO | IMAGEN | LABORATORIO | FUNCIONAL']
+  descripcion         text          [note: 'Descripción del examen']
+  activo              boolean       [not null, default: true, note: 'Indicador de disponibilidad (default: true)']
+  fecha_creacion      timestamptz   [not null, default: `now()`, note: 'Timestamp de creación']
+
+  Note: '''
+  Catálogo centralizado de exámenes disponibles.
+  '''
+}
+
+Table region_anatomica {
+  region_id  smallserial  [pk, increment, note: 'ID numérico único (autogenerado)']
+  nombre     varchar(50)  [not null, unique, note: 'Nombre de la región (ej: Cabeza y cuello, Tronco)']
+  orden      smallint     [not null, note: 'Orden de presentación en la UI']
+  activo     boolean      [not null, default: true, note: 'Indicador de disponibilidad (default: true)']
+
+  Note: '''
+  Agrupación anatómica de alto nivel. Cada región contiene N partes del cuerpo.
+  '''
+}
+
+Table parte_del_cuerpo {
+  parte_id              smallserial  [pk, increment, note: 'ID numérico único (autogenerado)']
+  region_id             smallint     [not null, note: 'Región anatómica a la que pertenece (FK → `region_anatomica`)']
+  nombre                varchar(50)  [not null, note: 'Nombre de la parte (ej: Ojos, Manos, Pies)']
+  orden                 smallint     [not null, default: 0, note: 'Orden dentro de la región (default: 0)']
+  requiere_lateralidad  boolean      [not null, default: true, note: 'Si `true`, el médico debe especificar lateralidad al registrar un signo']
+  permite_linea_media   boolean      [not null, default: true, note: 'Si `true`, la opción "Línea media" es válida para esta parte']
+  activo                boolean      [not null, default: true, note: 'Indicador de disponibilidad (default: true)']
+
+  indexes {
+    (region_id, nombre) [name: 'uq_parte_region_nombre', unique]
+  }
+
+  Note: '''
+  Partes anatómicas del cuerpo, organizadas por región. Indica si la parte requiere lateralidad y si admite línea media.
+  '''
+}
+
+Table lateralidad {
+  lateralidad_id  smallserial  [pk, increment, note: 'ID numérico único (autogenerado)']
+  codigo          varchar(10)  [not null, unique, note: 'Código corto: `NA` | `DER` | `IZQ` | `BILAT` | `MID`']
+  nombre          varchar(20)  [not null, unique, note: 'Nombre descriptivo: No aplica | Derecha | Izquierda | Bilateral | Línea media']
+  orden           smallint     [not null, note: 'Orden de presentación']
+  activo          boolean      [not null, default: true, note: 'Indicador de disponibilidad (default: true)']
+
+  Note: '''
+  Catálogo de opciones de lateralidad aplicables al registro de signos de alerta.
+  '''
+}
+
+Table referido_de {
+  referido_de_id  smallint      [pk, note: 'ID numérico único']
+  nombre          varchar(100)  [not null, note: 'Nombre de la fuente (ej: Hospital X, Clínica Y, Autorreferencia)']
+
+  Note: '''
+  Catálogo de fuentes de referencia para pacientes.
+  '''
+}
+
+Table asistencia_parto {
+  asistencia_parto_id  smallint      [pk, note: 'ID numérico único']
+  nombre               varchar(100)  [not null, note: 'Nombre del tipo (ej: Parto Vaginal, Cesárea, Forceps)']
+
+  Note: '''
+  Catálogo de tipos de asistencia médica en el parto.
+  '''
+}
+
+Table familiar_catalogo {
+  familiar_catalogo_id  smallint      [pk, note: 'ID numérico único']
+  nombre                varchar(100)  [not null, unique, note: 'Tipo de relación (ej: MADRE, PADRE, HERMANO_A, ABUELO_MATERNO, ABUELA_MATERNA, ABUELO_PATERNO, ABUELA_PATERNA, TIO_MATERNO, TIA_MATERNA, TIO_PATERNO, TIA_PATERNA, PRIMO_A, OTRO_FAMILIAR)']
+
+  Note: '''
+  Catálogo de tipos de relaciones familiares para registro de familiares afectados.
+  '''
+}
+
+Table sexo_catalogo {
+  sexo_id  smallint     [pk, note: 'ID del catalogo']
+  codigo   varchar(1)   [not null, unique, note: 'M | F | I']
+  nombre   varchar(50)  [not null, note: 'Masculino | Femenino | Indeterminado']
+  activo   boolean      [not null, default: true, note: 'FALSE lo oculta en el formulario']
+  orden    smallint     [not null, note: 'Orden de despliegue']
+
+  Note: '''
+  Catalogo de sexo del paciente.
+  '''
+}
+
+
+// ------------------------------------------------------------
+// Control de migraciones
+// ------------------------------------------------------------
+
+Table schema_migrations {
+  version     varchar(200)  [pk, note: 'Nombre del archivo NN_*.sql aplicado']
+  applied_at  timestamptz   [not null, default: `now()`, note: 'Cuando se aplico']
+
+  Note: '''
+  Migraciones aplicadas por el servicio migrate (local) o make migrate (AWS).
+  '''
+}
+
+
+// ------------------------------------------------------------
+// Relaciones
+// ------------------------------------------------------------
+
+Ref usuario_system_id_fkey: usuario.system_id > sistema_externo.system_id
+Ref sistema_externo_permiso_system_id_fkey: sistema_externo_permiso.system_id > sistema_externo.system_id
+Ref sesion_integracion_ficha_id_fkey: sesion_integracion.ficha_id > ficha_clinica.ficha_id
+Ref sesion_integracion_system_id_fkey: sesion_integracion.system_id > sistema_externo.system_id
+Ref nonce_usado_system_id_fkey: nonce_usado.system_id > sistema_externo.system_id
+Ref paciente_system_id_fkey: paciente.system_id > sistema_externo.system_id
+Ref paciente_nombre_token_paciente_id_fkey: paciente_nombre_token.paciente_id > paciente.paciente_id [delete: cascade]
+Ref ficha_clinica_creado_por_fkey: ficha_clinica.creado_por > usuario.usuario_id
+Ref ficha_clinica_medico_id_fkey: ficha_clinica.medico_id > usuario.usuario_id
+Ref ficha_clinica_modificado_por_fkey: ficha_clinica.modificado_por > usuario.usuario_id
+Ref ficha_clinica_paciente_id_fkey: ficha_clinica.paciente_id > paciente.paciente_id
+Ref ficha_clinica_sesion_id_fkey: ficha_clinica.sesion_id > sesion_integracion.sesion_id
+Ref fk_ficha_institucion_tenant: ficha_clinica.id_tenant > institucion_tenant.id_tenant
+Ref fk_ficha_raiz: ficha_clinica.ficha_raiz_id > ficha_clinica.ficha_id
+Ref fk_ficha_resuelta_por: ficha_clinica.resuelta_por > usuario.usuario_id
+Ref datos_adicionales_ficha_asistencia_parto_id_fkey: datos_adicionales_ficha.asistencia_parto_id > asistencia_parto.asistencia_parto_id
+Ref datos_adicionales_ficha_ficha_id_fkey: datos_adicionales_ficha.ficha_id - ficha_clinica.ficha_id
+Ref datos_adicionales_ficha_referido_de_id_fkey: datos_adicionales_ficha.referido_de_id > referido_de.referido_de_id
+Ref fk_datos_adicionales_sexo: datos_adicionales_ficha.sexo_id > sexo_catalogo.sexo_id
+Ref familiar_afectado_familiar_catalogo_id_fkey: familiar_afectado.familiar_catalogo_id > familiar_catalogo.familiar_catalogo_id
+Ref familiar_afectado_ficha_id_fkey: familiar_afectado.ficha_id > ficha_clinica.ficha_id
+Ref fk_signo_replaces: signo_alerta_ficha.replaces_signo_id > signo_alerta_ficha.signo_id
+Ref signo_alerta_ficha_ficha_id_fkey: signo_alerta_ficha.ficha_id > ficha_clinica.ficha_id
+Ref signo_alerta_ficha_parte_id_fkey: signo_alerta_ficha.parte_id > parte_del_cuerpo.parte_id
+Ref signo_alerta_ficha_registrado_por_fkey: signo_alerta_ficha.registrado_por > usuario.usuario_id
+Ref examen_ficha_ficha_id_fkey: examen_ficha.ficha_id > ficha_clinica.ficha_id
+Ref examen_ficha_registrado_por_fkey: examen_ficha.registrado_por > usuario.usuario_id
+Ref fk_examen_replaces: examen_ficha.replaces_examen_id > examen_ficha.examen_ficha_id
+Ref fk_observacion_ficha: observacion_ficha.ficha_id > ficha_clinica.ficha_id
+Ref fk_observacion_usuario: observacion_ficha.usuario_id > usuario.usuario_id
+Ref resultado_ia_ejecutado_por_fkey: resultado_ia.ejecutado_por > usuario.usuario_id
+Ref resultado_ia_ficha_id_fkey: resultado_ia.ficha_id > ficha_clinica.ficha_id
+Ref ficha_provisional_creado_por_fkey: ficha_provisional.creado_por > usuario.usuario_id
+Ref ficha_provisional_ficha_consolidada_id_fkey: ficha_provisional.ficha_consolidada_id > ficha_clinica.ficha_id
+Ref ficha_provisional_ficha_raiz_id_fkey: ficha_provisional.ficha_raiz_id - ficha_clinica.ficha_id
+Ref ficha_provisional_id_tenant_fkey: ficha_provisional.id_tenant > institucion_tenant.id_tenant
+Ref ficha_provisional_resuelto_por_fkey: ficha_provisional.resuelto_por > usuario.usuario_id
+Ref consentimiento_anulado_por_id_fkey: consentimiento.anulado_por_id > usuario.usuario_id
+Ref consentimiento_ficha_id_fkey: consentimiento.ficha_id - ficha_clinica.ficha_id
+Ref consentimiento_medico_id_fkey: consentimiento.medico_id > usuario.usuario_id
+Ref auditoria_evento_usuario_id_fkey: auditoria_evento.usuario_id > usuario.usuario_id
+Ref fk_auditoria_tipo_evento: auditoria_evento.tipo_evento > tipo_evento_catalogo.codigo
+Ref ficha_cambio_ficha_id_fkey: ficha_cambio.ficha_id > ficha_clinica.ficha_id
+Ref ficha_cambio_usuario_id_fkey: ficha_cambio.usuario_id > usuario.usuario_id
+Ref cie10_run_rag_version_fkey: cie10_run.rag_version > cie10_rag_version.rag_version
+Ref cie10_sugerencia_rag_version_fkey: cie10_sugerencia.rag_version > cie10_rag_version.rag_version
+Ref cie10_sugerencia_run_id_fkey: cie10_sugerencia.run_id > cie10_run.run_id
+Ref cie10_decision_codigo_interno_catalogo_fkey: cie10_decision.codigo_interno_catalogo > cie10_catalogo.codigo_interno
+Ref cie10_decision_codigo_traductor_fkey: cie10_decision.codigo_traductor - cie10_sugerencia.codigo_traductor
+Ref cie10_revision_item_codigo_traductor_fkey: cie10_revision_item.codigo_traductor > cie10_sugerencia.codigo_traductor
+Ref cie10_revision_item_run_id_fkey: cie10_revision_item.run_id > cie10_run.run_id
+Ref cie10_lote_confirmacion_clausula_version_fkey: cie10_lote_confirmacion.clausula_version > cie10_clausula.version
+Ref cie10_lote_confirmacion_run_id_fkey: cie10_lote_confirmacion.run_id - cie10_run.run_id
+Ref cie10_rag_catalogo_rag_version_fkey: cie10_rag_catalogo.rag_version > cie10_rag_version.rag_version [delete: cascade]
+Ref parte_del_cuerpo_region_id_fkey: parte_del_cuerpo.region_id > region_anatomica.region_id
+
+TableGroup organizacion {
+  usuario
+  institucion_tenant
+}
+
+TableGroup integracion {
+  sistema_externo
+  sistema_externo_permiso
+  sesion_integracion
+  nonce_usado
+}
+
+TableGroup paciente {
+  paciente
+  paciente_nombre_token
+}
+
+TableGroup clinico {
+  ficha_clinica
+  datos_adicionales_ficha
+  familiar_afectado
+  signo_alerta_ficha
+  examen_ficha
+  observacion_ficha
+  resultado_ia
+  ficha_provisional
+}
+
+TableGroup consentimiento {
+  consentimiento
+}
+
+TableGroup auditoria {
+  auditoria_evento
+  tipo_evento_catalogo
+  ficha_cambio
+}
+
+TableGroup cie10 {
+  cie10_run
+  cie10_sugerencia
+  cie10_decision
+  cie10_decision_historial
+  cie10_catalogo
+  cie10_revision_item
+  cie10_lote_confirmacion
+  cie10_clausula
+  cie10_rag_version
+  cie10_rag_catalogo
+}
+
+TableGroup catalogos {
+  signo_catalogo
+  examen_catalogo
+  region_anatomica
+  parte_del_cuerpo
+  lateralidad
+  referido_de
+  asistencia_parto
+  familiar_catalogo
+  sexo_catalogo
+}
+
+TableGroup control {
+  schema_migrations
+}
